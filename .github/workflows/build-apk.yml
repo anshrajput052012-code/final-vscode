@@ -81,7 +81,6 @@ jobs:
           except Exception as e:
               print("GH API Note:", e)
 
-          # Official Docker Debian Bookworm ARM64 rootfs mirror
           urls.append("https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/dist-arm64v8/bookworm/rootfs.tar.xz")
           urls.append("http://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04-base-arm64.tar.gz")
 
@@ -104,7 +103,7 @@ jobs:
                               downloaded = True
                               break
               except Exception as e:
-                  print(f"Skipping failed mirror {url}: {e}")
+                  print(f"Skipping failed mirror: {e}")
 
           if not downloaded:
               print("Failed to download rootfs during build")
@@ -307,38 +306,67 @@ jobs:
           }
           EOF
 
-      - name: Fetch and Patch ARM64 Binaries with patchelf
+      - name: Fetch and Patch ARM64 Binaries (libproot, libtalloc, libandroid-shmem)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y patchelf
 
-          mkdir -p app/src/main/jniLibs/arm64-v8a
-          mkdir -p /tmp/proot-extract
-          cd /tmp/proot-extract
+          mkdir -p /tmp/debs
+          cd /tmp/debs
 
           PACKAGES_URL="https://packages.termux.dev/apt/termux-main/dists/stable/main/binary-aarch64/Packages"
           curl -sL "$PACKAGES_URL" -o Packages
 
-          PROOT_DEB_PATH=$(awk '/^Package: proot$/,/^$/' Packages | grep '^Filename:' | awk '{print $2}')
-          TALLOC_DEB_PATH=$(awk '/^Package: libtalloc$/,/^$/' Packages | grep '^Filename:' | awk '{print $2}')
+          PROOT_DEB_PATH=$(awk '/^Package: proot$/,/^$/' Packages | grep '^Filename:' | head -n 1 | awk '{print $2}')
+          TALLOC_DEB_PATH=$(awk '/^Package: libtalloc$/,/^$/' Packages | grep '^Filename:' | head -n 1 | awk '{print $2}')
+          SHMEM_DEB_PATH=$(awk '/^Package: libandroid-shmem$/,/^$/' Packages | grep '^Filename:' | head -n 1 | awk '{print $2}')
+
+          if [ -z "$SHMEM_DEB_PATH" ]; then
+            SHMEM_DEB_PATH=$(grep -E 'libandroid-shmem.*_aarch64\.deb' Packages | head -n 1 | awk '{print $2}')
+          fi
+
+          echo "Fetching: $PROOT_DEB_PATH, $TALLOC_DEB_PATH, $SHMEM_DEB_PATH"
 
           curl -sL "https://packages.termux.dev/apt/termux-main/$PROOT_DEB_PATH" -o proot.deb
           curl -sL "https://packages.termux.dev/apt/termux-main/$TALLOC_DEB_PATH" -o talloc.deb
+          curl -sL "https://packages.termux.dev/apt/termux-main/$SHMEM_DEB_PATH" -o shmem.deb
 
-          ar x proot.deb data.tar.xz && tar -xf data.tar.xz
-          ar x talloc.deb data.tar.xz && tar -xf data.tar.xz
+          mkdir -p extract
+          for f in proot.deb talloc.deb shmem.deb; do
+            mkdir -p "extract/$f"
+            cd "extract/$f"
+            ar x "/tmp/debs/$f"
+            tar -xf data.tar.*
+            cd /tmp/debs
+          done
 
           DEST="$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a"
+          mkdir -p "$DEST"
 
-          cp data/data/com.termux/files/usr/lib/libtalloc.so.2 "$DEST/libtalloc.so"
+          # 1. Bundle libtalloc.so
+          TALLOC_SRC=$(find extract -name "libtalloc.so*" | head -n 1)
+          cp "$TALLOC_SRC" "$DEST/libtalloc.so"
           patchelf --set-soname libtalloc.so "$DEST/libtalloc.so"
+          patchelf --set-rpath '$ORIGIN' "$DEST/libtalloc.so" || true
 
-          cp data/data/com.termux/files/usr/bin/proot "$DEST/libproot.so"
-          patchelf --replace-needed libtalloc.so.2 libtalloc.so "$DEST/libproot.so"
+          # 2. Bundle libandroid-shmem.so
+          SHMEM_SRC=$(find extract -name "libandroid-shmem.so*" | head -n 1)
+          cp "$SHMEM_SRC" "$DEST/libandroid-shmem.so"
+          patchelf --set-soname libandroid-shmem.so "$DEST/libandroid-shmem.so"
+          patchelf --set-rpath '$ORIGIN' "$DEST/libandroid-shmem.so" || true
+
+          # 3. Bundle libproot.so
+          PROOT_SRC=$(find extract -path "*/usr/bin/proot" | head -n 1)
+          cp "$PROOT_SRC" "$DEST/libproot.so"
+          patchelf --replace-needed libtalloc.so.2 libtalloc.so "$DEST/libproot.so" || true
           patchelf --set-rpath '$ORIGIN' "$DEST/libproot.so"
 
-          cp data/data/com.termux/files/usr/libexec/proot/loader "$DEST/libproot-loader.so"
+          # 4. Bundle proot-loader
+          LOADER_SRC=$(find extract -path "*/libexec/proot/loader" | head -n 1)
+          cp "$LOADER_SRC" "$DEST/libproot-loader.so"
+
           chmod 755 "$DEST/"*.so*
+          ls -la "$DEST"
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
