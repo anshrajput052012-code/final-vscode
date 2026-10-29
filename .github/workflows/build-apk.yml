@@ -20,7 +20,6 @@ jobs:
 
       - name: Auto-Fix Folder Structure & Generate Root Configs
         run: |
-          # 1. Convert flattened app__* files back into actual nested folders
           for f in app__*; do
             if [ -f "$f" ]; then
               target=$(echo "$f" | sed 's/__/\//g')
@@ -29,7 +28,6 @@ jobs:
             fi
           done
 
-          # 2. Generate root settings.gradle.kts
           cat > settings.gradle.kts << 'EOF'
           pluginManagement {
               repositories {
@@ -49,7 +47,6 @@ jobs:
           include(":app")
           EOF
 
-          # 3. Generate root build.gradle.kts
           cat > build.gradle.kts << 'EOF'
           plugins {
               id("com.android.application") version "8.5.2" apply false
@@ -57,7 +54,6 @@ jobs:
           }
           EOF
 
-          # 4. Generate root gradle.properties
           cat > gradle.properties << 'EOF'
           org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8
           android.useAndroidX=true
@@ -65,14 +61,11 @@ jobs:
           android.nonTransitiveRClass=true
           EOF
 
-          # 5. Find current active live Debian rootfs URL from official Termux repo
           LIVE_DEBIAN_URL=$(curl -sL https://raw.githubusercontent.com/termux/proot-distro/master/distro-plugins/debian.sh | grep "TARBALL_URL\['aarch64'\]" | grep -o 'https://[^'\''"]*' | head -n 1)
           if [ -z "$LIVE_DEBIAN_URL" ]; then
-            LIVE_DEBIAN_URL=$(curl -sL https://api.github.com/repos/termux/proot-distro/releases | grep -o 'https://github.com/termux/proot-distro/releases/download/[^"]*debian[^"]*aarch64[^"]*\.tar\.[a-z0-9]*' | head -n 1)
+            LIVE_DEBIAN_URL="https://github.com/termux/proot-distro/releases/download/v4.19.0/debian-bookworm-aarch64-pd-v4.19.0.tar.xz"
           fi
-          echo "Discovered Live Debian URL: $LIVE_DEBIAN_URL"
 
-          # 6. StandaloneProvisioner with Live Mirror + Fallback system + Progress Tracker
           STANDALONE_PROV="app/src/main/java/com/vscode/desktop/standalone/StandaloneProvisioner.kt"
           mkdir -p "$(dirname "$STANDALONE_PROV")"
           cat > "$STANDALONE_PROV" << 'EOF'
@@ -92,10 +85,7 @@ jobs:
               companion object {
                   val DEBIAN_ROOTFS_URLS = listOf(
                       "@LIVE_DEBIAN_URL@",
-                      "https://github.com/termux/proot-distro/releases/download/v4.19.0/debian-bookworm-aarch64-pd-v4.19.0.tar.xz",
-                      "https://github.com/termux/proot-distro/releases/download/v4.18.0/debian-bookworm-aarch64-pd-v4.18.0.tar.xz",
-                      "https://github.com/termux/proot-distro/releases/download/v4.17.0/debian-bookworm-aarch64-pd-v4.17.0.tar.xz",
-                      "https://github.com/termux/proot-distro/releases/download/v4.16.0/debian-bookworm-aarch64-pd-v4.16.0.tar.xz"
+                      "https://github.com/termux/proot-distro/releases/download/v4.19.0/debian-bookworm-aarch64-pd-v4.19.0.tar.xz"
                   )
                   const val VSCODE_ARM64_URL = "https://update.code.visualstudio.com/latest/linux-arm64/stable"
               }
@@ -146,16 +136,14 @@ jobs:
                   for (candidate in urls) {
                       if (candidate.isBlank() || candidate.startsWith("@")) continue
                       try {
-                          onProgress("Connecting: $candidate")
                           downloadFile(candidate, destination, onProgress)
                           return
                       } catch (e: Exception) {
                           lastEx = e
                           destination.delete()
-                          onProgress("Link unreachable (${e.message}), trying backup mirror...")
                       }
                   }
-                  throw (lastEx ?: IOException("All download mirrors failed."))
+                  throw (lastEx ?: IOException("All mirrors failed"))
               }
 
               private fun downloadFile(urlStr: String, destination: File, onProgress: (String) -> Unit) {
@@ -164,21 +152,19 @@ jobs:
                   while (redirects < 10) {
                       val conn = URL(currentUrl).openConnection() as HttpURLConnection
                       conn.instanceFollowRedirects = false
-                      conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36")
+                      conn.setRequestProperty("User-Agent", "Mozilla/5.0")
                       conn.connectTimeout = 30000
                       conn.readTimeout = 30000
                       val code = conn.responseCode
                       if (code in listOf(301, 302, 303, 307, 308)) {
                           val loc = conn.getHeaderField("Location")
                           if (loc != null) {
-                              currentUrl = if (loc.startsWith("http://") || loc.startsWith("https://")) loc else URL(URL(currentUrl), loc).toString()
+                              currentUrl = if (loc.startsWith("http")) loc else URL(URL(currentUrl), loc).toString()
                               redirects++
                               continue
                           }
                       }
-                      if (code != 200) {
-                          throw IOException("HTTP $code on $currentUrl")
-                      }
+                      if (code != 200) throw IOException("HTTP $code on $currentUrl")
                       val totalBytes = conn.contentLengthLong
                       BufferedInputStream(conn.inputStream).use { input ->
                           FileOutputStream(destination).use { output ->
@@ -200,25 +186,10 @@ jobs:
                       }
                       return
                   }
-                  throw IOException("Too many redirects: $currentUrl")
-              }
-
-              private fun isXzArchive(file: File): Boolean {
-                  return try {
-                      FileInputStream(file).use { fis ->
-                          val b = ByteArray(6)
-                          val r = fis.read(b)
-                          r >= 6 && b[0] == 0xFD.toByte() && b[1] == '7'.code.toByte() &&
-                                  b[2] == 'z'.code.toByte() && b[3] == 'X'.code.toByte() &&
-                                  b[4] == 'Z'.code.toByte() && b[5] == 0x00.toByte()
-                      }
-                  } catch (_: Exception) {
-                      false
-                  }
               }
 
               private fun extractTarArchive(archiveFile: File, destDir: File) {
-                  val isXz = isXzArchive(archiveFile)
+                  val isXz = archiveFile.name.endsWith(".xz") || archiveFile.name.contains("pd-")
                   FileInputStream(archiveFile).use { fis ->
                       val compStream = if (isXz) XZCompressorInputStream(BufferedInputStream(fis)) else GzipCompressorInputStream(BufferedInputStream(fis))
                       TarArchiveInputStream(compStream).use { tar ->
@@ -228,11 +199,7 @@ jobs:
                               val cleanName = entry.name.trimStart('.', '/')
                               if (cleanName.isNotEmpty()) {
                                   val parts = cleanName.split("/").filter { it.isNotEmpty() }
-                                  val finalRelPath = if (parts.size > 1 && !standardDirs.contains(parts[0])) {
-                                      parts.drop(1).joinToString("/")
-                                  } else {
-                                      parts.joinToString("/")
-                                  }
+                                  val finalRelPath = if (parts.size > 1 && !standardDirs.contains(parts[0])) parts.drop(1).joinToString("/") else parts.joinToString("/")
                                   if (finalRelPath.isNotEmpty()) {
                                       val outFile = File(destDir, finalRelPath)
                                       if (entry.isDirectory) {
@@ -244,9 +211,7 @@ jobs:
                                       } else {
                                           outFile.parentFile?.mkdirs()
                                           FileOutputStream(outFile).use { out -> tar.copyTo(out) }
-                                          if ((entry.mode and 0b001_000_000) != 0) {
-                                              outFile.setExecutable(true, false)
-                                          }
+                                          if ((entry.mode and 0b001_000_000) != 0) outFile.setExecutable(true, false)
                                       }
                                   }
                               }
@@ -258,7 +223,6 @@ jobs:
           }
           EOF
 
-          # Inject the verified live URL into the source code
           python3 -c "
           path = '$STANDALONE_PROV'
           url = '$LIVE_DEBIAN_URL'
@@ -269,8 +233,11 @@ jobs:
               f.write(c)
           "
 
-      - name: Fetch Genuine ARM64 libproot.so & libtalloc.so.2
+      - name: Fetch and Patch ARM64 Binaries with patchelf
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y patchelf
+
           mkdir -p app/src/main/jniLibs/arm64-v8a
           mkdir -p /tmp/proot-extract
           cd /tmp/proot-extract
@@ -287,10 +254,21 @@ jobs:
           ar x proot.deb data.tar.xz && tar -xf data.tar.xz
           ar x talloc.deb data.tar.xz && tar -xf data.tar.xz
 
-          cp data/data/com.termux/files/usr/bin/proot "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libproot.so"
-          cp data/data/com.termux/files/usr/libexec/proot/loader "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libproot-loader.so"
-          cp data/data/com.termux/files/usr/lib/libtalloc.so.2 "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libtalloc.so.2"
-          chmod 755 "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/"*.so*
+          DEST="$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a"
+
+          # 1. Patch libtalloc so it has soname libtalloc.so and strict .so filename
+          cp data/data/com.termux/files/usr/lib/libtalloc.so.2 "$DEST/libtalloc.so"
+          patchelf --set-soname libtalloc.so "$DEST/libtalloc.so"
+
+          # 2. Patch libproot so it looks for libtalloc.so in its own directory ($ORIGIN)
+          cp data/data/com.termux/files/usr/bin/proot "$DEST/libproot.so"
+          patchelf --replace-needed libtalloc.so.2 libtalloc.so "$DEST/libproot.so"
+          patchelf --set-rpath '$ORIGIN' "$DEST/libproot.so"
+
+          # 3. Copy loader
+          cp data/data/com.termux/files/usr/libexec/proot/loader "$DEST/libproot-loader.so"
+
+          chmod 755 "$DEST/"*.so*
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
