@@ -61,11 +61,59 @@ jobs:
           android.nonTransitiveRClass=true
           EOF
 
-          LIVE_DEBIAN_URL=$(curl -sL https://raw.githubusercontent.com/termux/proot-distro/master/distro-plugins/debian.sh | grep "TARBALL_URL\['aarch64'\]" | grep -o 'https://[^'\''"]*' | head -n 1)
-          if [ -z "$LIVE_DEBIAN_URL" ]; then
-            LIVE_DEBIAN_URL="https://github.com/termux/proot-distro/releases/download/v4.19.0/debian-bookworm-aarch64-pd-v4.19.0.tar.xz"
-          fi
+      - name: Fetch and Bundle Genuine Debian Rootfs into APK Assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p app/src/main/assets
+          python3 - << 'EOF'
+          import urllib.request, json, subprocess, os, sys
 
+          urls = []
+          try:
+              res = subprocess.run(["gh", "api", "repos/termux/proot-distro/releases?per_page=100"], capture_output=True, text=True)
+              releases = json.loads(res.stdout)
+              for rel in releases:
+                  for asset in rel.get("assets", []):
+                      name = asset.get("name", "")
+                      if "debian" in name and "aarch64" in name and ("tar.xz" in name or "tar.gz" in name):
+                          urls.append(asset.get("browser_download_url"))
+          except Exception as e:
+              print("GH API Note:", e)
+
+          # Official Docker Debian Bookworm ARM64 rootfs mirror
+          urls.append("https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/dist-arm64v8/bookworm/rootfs.tar.xz")
+          urls.append("http://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04-base-arm64.tar.gz")
+
+          downloaded = False
+          for url in urls:
+              print(f"Downloading Rootfs from: {url}")
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                  with urllib.request.urlopen(req, timeout=60) as resp:
+                      if resp.status in (200, 302):
+                          ext = ".xz" if "xz" in url else ".gz"
+                          dest = f"app/src/main/assets/debian-rootfs.tar{ext}"
+                          with open(dest, "wb") as f:
+                              while True:
+                                  chunk = resp.read(1024 * 1024)
+                                  if not chunk: break
+                                  f.write(chunk)
+                          if os.path.getsize(dest) > 10 * 1024 * 1024:
+                              print(f"Successfully bundled rootfs: {dest}")
+                              downloaded = True
+                              break
+              except Exception as e:
+                  print(f"Skipping failed mirror {url}: {e}")
+
+          if not downloaded:
+              print("Failed to download rootfs during build")
+              sys.exit(1)
+          EOF
+          ls -lh app/src/main/assets/
+
+      - name: Configure StandaloneProvisioner with Embedded Rootfs and Auto-Resume
+        run: |
           STANDALONE_PROV="app/src/main/java/com/vscode/desktop/standalone/StandaloneProvisioner.kt"
           mkdir -p "$(dirname "$STANDALONE_PROV")"
           cat > "$STANDALONE_PROV" << 'EOF'
@@ -83,35 +131,44 @@ jobs:
 
           class StandaloneProvisioner(private val context: Context, private val prootManager: ProotProcessManager) {
               companion object {
-                  val DEBIAN_ROOTFS_URLS = listOf(
-                      "@LIVE_DEBIAN_URL@",
-                      "https://github.com/termux/proot-distro/releases/download/v4.19.0/debian-bookworm-aarch64-pd-v4.19.0.tar.xz"
-                  )
                   const val VSCODE_ARM64_URL = "https://update.code.visualstudio.com/latest/linux-arm64/stable"
               }
 
               fun provisionAll(onProgress: (String) -> Unit): Boolean {
                   return try {
                       exportAssetScripts()
-                      val rootfsTar = File(prootManager.tmpDir, "debian-arm64-rootfs.tar")
                       if (!File(prootManager.rootfsDir, "bin/bash").exists()) {
-                          onProgress("1/4 Downloading ARM64 Debian Rootfs...")
-                          downloadWithFallbacks(DEBIAN_ROOTFS_URLS, rootfsTar, onProgress)
-                          onProgress("2/4 Extracting Debian Rootfs...")
-                          extractTarArchive(rootfsTar, prootManager.rootfsDir)
-                          rootfsTar.delete()
+                          onProgress("1/4 Extracting Embedded ARM64 Debian Rootfs from APK...")
+                          val assetList = context.assets.list("") ?: emptyArray()
+                          val rootfsAsset = assetList.firstOrNull { it.startsWith("debian-rootfs.tar") }
+                          if (rootfsAsset != null) {
+                              val rootfsTar = File(prootManager.tmpDir, rootfsAsset)
+                              context.assets.open(rootfsAsset).use { input ->
+                                  FileOutputStream(rootfsTar).use { output -> input.copyTo(output) }
+                              }
+                              extractTarArchive(rootfsTar, prootManager.rootfsDir)
+                              rootfsTar.delete()
+                          } else {
+                              throw IOException("Embedded Debian rootfs not found in APK assets!")
+                          }
+                      } else {
+                          onProgress("1/4 Debian Rootfs already installed.")
                       }
+
                       val vscodeDir = File(prootManager.rootfsDir, "opt/vscode-arm64")
                       if (!File(vscodeDir, "bin/code").exists()) {
                           vscodeDir.mkdirs()
                           val vscodeTar = File(prootManager.tmpDir, "vscode-linux-arm64.tar.gz")
-                          onProgress("3/4 Downloading Official Microsoft VS Code...")
-                          downloadFile(VSCODE_ARM64_URL, vscodeTar, onProgress)
-                          onProgress("4/4 Extracting Genuine VS Code...")
+                          onProgress("2/4 Downloading Official Microsoft VS Code...")
+                          downloadWithResume(VSCODE_ARM64_URL, vscodeTar, onProgress)
+                          onProgress("3/4 Extracting Genuine VS Code...")
                           extractTarArchive(vscodeTar, vscodeDir)
                           vscodeTar.delete()
+                      } else {
+                          onProgress("2/4 Official VS Code already installed.")
                       }
-                      onProgress("Configuring Environment...")
+
+                      onProgress("4/4 Configuring Environment...")
                       val p = prootManager.startProotCommand("bash /root/init-rootfs.sh", prootManager.homeDir.absolutePath, onLogLine = onProgress)
                       val exit = p.waitFor()
                       onProgress("Provisioning finished with code $exit")
@@ -125,28 +182,15 @@ jobs:
               private fun exportAssetScripts() {
                   val targetDir = File(prootManager.rootfsDir, "root").apply { mkdirs() }
                   listOf("init-rootfs.sh", "start-vscode-session.sh", "verify-vscode.sh").forEach { name ->
-                      val outFile = File(targetDir, name)
-                      context.assets.open(name).use { input -> FileOutputStream(outFile).use { output -> input.copyTo(output) } }
-                      outFile.setExecutable(true, false)
-                  }
-              }
-
-              private fun downloadWithFallbacks(urls: List<String>, destination: File, onProgress: (String) -> Unit) {
-                  var lastEx: Exception? = null
-                  for (candidate in urls) {
-                      if (candidate.isBlank() || candidate.startsWith("@")) continue
                       try {
-                          downloadFile(candidate, destination, onProgress)
-                          return
-                      } catch (e: Exception) {
-                          lastEx = e
-                          destination.delete()
-                      }
+                          val outFile = File(targetDir, name)
+                          context.assets.open(name).use { input -> FileOutputStream(outFile).use { output -> input.copyTo(output) } }
+                          outFile.setExecutable(true, false)
+                      } catch (_: Exception) {}
                   }
-                  throw (lastEx ?: IOException("All mirrors failed"))
               }
 
-              private fun downloadFile(urlStr: String, destination: File, onProgress: (String) -> Unit) {
+              private fun downloadWithResume(urlStr: String, destination: File, onProgress: (String) -> Unit) {
                   var currentUrl = urlStr
                   var redirects = 0
                   while (redirects < 10) {
@@ -164,32 +208,70 @@ jobs:
                               continue
                           }
                       }
-                      if (code != 200) throw IOException("HTTP $code on $currentUrl")
-                      val totalBytes = conn.contentLengthLong
-                      BufferedInputStream(conn.inputStream).use { input ->
-                          FileOutputStream(destination).use { output ->
-                              val buffer = ByteArray(64 * 1024)
-                              var downloaded = 0L
-                              var read: Int
-                              var lastMb = -1L
-                              while (input.read(buffer).also { read = it } != -1) {
-                                  output.write(buffer, 0, read)
-                                  downloaded += read
-                                  val mb = downloaded / (1024 * 1024)
-                                  if (mb != lastMb && mb % 5L == 0L) {
-                                      lastMb = mb
-                                      val totalMb = if (totalBytes > 0) "${totalBytes / (1024 * 1024)} MB" else "..."
-                                      onProgress("Downloaded $mb MB / $totalMb...")
-                                  }
+                      break
+                  }
+
+                  val existingBytes = if (destination.exists()) destination.length() else 0L
+                  val conn = URL(currentUrl).openConnection() as HttpURLConnection
+                  conn.setRequestProperty("User-Agent", "Mozilla/5.0")
+                  conn.connectTimeout = 30000
+                  conn.readTimeout = 30000
+
+                  var isResume = false
+                  if (existingBytes > 0) {
+                      conn.setRequestProperty("Range", "bytes=$existingBytes-")
+                  }
+
+                  val code = conn.responseCode
+                  if (code == 206) {
+                      isResume = true
+                  } else if (code == 200) {
+                      isResume = false
+                  } else if (code == 416) {
+                      return
+                  } else {
+                      throw IOException("HTTP $code on $currentUrl")
+                  }
+
+                  val totalLength = if (isResume) existingBytes + conn.contentLengthLong else conn.contentLengthLong
+                  val append = isResume
+                  var downloaded = if (isResume) existingBytes else 0L
+
+                  BufferedInputStream(conn.inputStream).use { input ->
+                      FileOutputStream(destination, append).use { output ->
+                          val buffer = ByteArray(64 * 1024)
+                          var read: Int
+                          var lastMb = -1L
+                          while (input.read(buffer).also { read = it } != -1) {
+                              output.write(buffer, 0, read)
+                              downloaded += read
+                              val mb = downloaded / (1024 * 1024)
+                              if (mb != lastMb && mb % 5L == 0L) {
+                                  lastMb = mb
+                                  val totalMb = if (totalLength > 0) "${totalLength / (1024 * 1024)} MB" else "..."
+                                  onProgress("Downloaded $mb MB / $totalMb...")
                               }
                           }
                       }
-                      return
+                  }
+              }
+
+              private fun isXzArchive(file: File): Boolean {
+                  return try {
+                      FileInputStream(file).use { fis ->
+                          val b = ByteArray(6)
+                          val r = fis.read(b)
+                          r >= 6 && b[0] == 0xFD.toByte() && b[1] == '7'.code.toByte() &&
+                                  b[2] == 'z'.code.toByte() && b[3] == 'X'.code.toByte() &&
+                                  b[4] == 'Z'.code.toByte() && b[5] == 0x00.toByte()
+                      }
+                  } catch (_: Exception) {
+                      false
                   }
               }
 
               private fun extractTarArchive(archiveFile: File, destDir: File) {
-                  val isXz = archiveFile.name.endsWith(".xz") || archiveFile.name.contains("pd-")
+                  val isXz = archiveFile.name.endsWith(".xz") || isXzArchive(archiveFile)
                   FileInputStream(archiveFile).use { fis ->
                       val compStream = if (isXz) XZCompressorInputStream(BufferedInputStream(fis)) else GzipCompressorInputStream(BufferedInputStream(fis))
                       TarArchiveInputStream(compStream).use { tar ->
@@ -211,7 +293,9 @@ jobs:
                                       } else {
                                           outFile.parentFile?.mkdirs()
                                           FileOutputStream(outFile).use { out -> tar.copyTo(out) }
-                                          if ((entry.mode and 0b001_000_000) != 0) outFile.setExecutable(true, false)
+                                          if ((entry.mode and 0b001_000_000) != 0) {
+                                              outFile.setExecutable(true, false)
+                                          }
                                       }
                                   }
                               }
@@ -222,16 +306,6 @@ jobs:
               }
           }
           EOF
-
-          python3 -c "
-          path = '$STANDALONE_PROV'
-          url = '$LIVE_DEBIAN_URL'
-          with open(path, 'r') as f:
-              c = f.read()
-          c = c.replace('@LIVE_DEBIAN_URL@', url)
-          with open(path, 'w') as f:
-              f.write(c)
-          "
 
       - name: Fetch and Patch ARM64 Binaries with patchelf
         run: |
@@ -256,18 +330,14 @@ jobs:
 
           DEST="$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a"
 
-          # 1. Patch libtalloc so it has soname libtalloc.so and strict .so filename
           cp data/data/com.termux/files/usr/lib/libtalloc.so.2 "$DEST/libtalloc.so"
           patchelf --set-soname libtalloc.so "$DEST/libtalloc.so"
 
-          # 2. Patch libproot so it looks for libtalloc.so in its own directory ($ORIGIN)
           cp data/data/com.termux/files/usr/bin/proot "$DEST/libproot.so"
           patchelf --replace-needed libtalloc.so.2 libtalloc.so "$DEST/libproot.so"
           patchelf --set-rpath '$ORIGIN' "$DEST/libproot.so"
 
-          # 3. Copy loader
           cp data/data/com.termux/files/usr/libexec/proot/loader "$DEST/libproot-loader.so"
-
           chmod 755 "$DEST/"*.so*
 
       - name: Setup Gradle
