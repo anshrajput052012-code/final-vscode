@@ -18,7 +18,155 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Fetch Genuine ARM64 libproot.so & libtalloc.so.2 into jniLibs/arm64-v8a
+      - name: Auto-Fix Folder Structure & Generate Root Configs
+        run: |
+          # 1. Convert flattened app__* files back into actual nested folders
+          for f in app__*; do
+            if [ -f "$f" ]; then
+              target=$(echo "$f" | sed 's/__/\//g')
+              mkdir -p "$(dirname "$target")"
+              mv "$f" "$target"
+            fi
+          done
+
+          # 2. Generate missing root settings.gradle.kts
+          cat > settings.gradle.kts << 'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "VSCodeAndroidStandalone"
+          include(":app")
+          EOF
+
+          # 3. Generate missing root build.gradle.kts
+          cat > build.gradle.kts << 'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          # 4. Generate missing root gradle.properties
+          cat > gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          EOF
+
+          # 5. Ensure StandaloneProvisioner.kt exists
+          STANDALONE_PROV="app/src/main/java/com/vscode/desktop/standalone/StandaloneProvisioner.kt"
+          if [ ! -f "$STANDALONE_PROV" ]; then
+            mkdir -p "$(dirname "$STANDALONE_PROV")"
+            cat > "$STANDALONE_PROV" << 'EOF'
+          package com.vscode.desktop.standalone
+
+          import android.content.Context
+          import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
+          import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
+          import org.apache.commons.compress.compressors.xz.XZCompressorInputStream
+          import java.io.*
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.nio.file.Files
+          import java.nio.file.Paths
+
+          class StandaloneProvisioner(private val context: Context, private val prootManager: ProotProcessManager) {
+              companion object {
+                  const val DEBIAN_ROOTFS_URL = "https://github.com/termux/proot-distro/releases/download/v4.15.0/debian-bookworm-aarch64-pd-v4.15.0.tar.xz"
+                  const val VSCODE_ARM64_URL = "https://update.code.visualstudio.com/latest/linux-arm64/stable"
+              }
+
+              fun provisionAll(onProgress: (String) -> Unit): Boolean {
+                  return try {
+                      exportAssetScripts()
+                      val rootfsTar = File(prootManager.tmpDir, "debian-arm64.tar.xz")
+                      if (!File(prootManager.rootfsDir, "bin/bash").exists()) {
+                          onProgress("Downloading ARM64 Debian Rootfs...")
+                          downloadFile(DEBIAN_ROOTFS_URL, rootfsTar, onProgress)
+                          onProgress("Extracting Rootfs...")
+                          extractTarArchive(rootfsTar, prootManager.rootfsDir, isXz = true, stripComponents = 1)
+                          rootfsTar.delete()
+                      }
+                      val vscodeDir = File(prootManager.rootfsDir, "opt/vscode-arm64")
+                      if (!File(vscodeDir, "bin/code").exists()) {
+                          vscodeDir.mkdirs()
+                          val vscodeTar = File(prootManager.tmpDir, "vscode-linux-arm64.tar.gz")
+                          onProgress("Downloading Official Microsoft VS Code...")
+                          downloadFile(VSCODE_ARM64_URL, vscodeTar, onProgress)
+                          onProgress("Extracting VS Code...")
+                          extractTarArchive(vscodeTar, vscodeDir, isXz = false, stripComponents = 1)
+                          vscodeTar.delete()
+                      }
+                      onProgress("Configuring Environment...")
+                      val p = prootManager.startProotCommand("bash /root/init-rootfs.sh", prootManager.homeDir.absolutePath, onLogLine = onProgress)
+                      p.waitFor() == 0
+                  } catch (e: Exception) {
+                      onProgress("ERROR: ${e.message}")
+                      false
+                  }
+              }
+
+              private fun exportAssetScripts() {
+                  val targetDir = File(prootManager.rootfsDir, "root").apply { mkdirs() }
+                  listOf("init-rootfs.sh", "start-vscode-session.sh", "verify-vscode.sh").forEach { name ->
+                      val outFile = File(targetDir, name)
+                      context.assets.open(name).use { input -> FileOutputStream(outFile).use { output -> input.copyTo(output) } }
+                      outFile.setExecutable(true, false)
+                  }
+              }
+
+              private fun downloadFile(urlStr: String, destination: File, onProgress: (String) -> Unit) {
+                  val conn = URL(urlStr).openConnection() as HttpURLConnection
+                  conn.instanceFollowRedirects = true
+                  BufferedInputStream(conn.inputStream).use { input ->
+                      FileOutputStream(destination).use { output -> input.copyTo(output) }
+                  }
+              }
+
+              private fun extractTarArchive(archiveFile: File, destDir: File, isXz: Boolean, stripComponents: Int) {
+                  FileInputStream(archiveFile).use { fis ->
+                      val comp = if (isXz) XZCompressorInputStream(BufferedInputStream(fis)) else GzipCompressorInputStream(BufferedInputStream(fis))
+                      TarArchiveInputStream(comp).use { tar ->
+                          var entry = tar.nextTarEntry
+                          while (entry != null) {
+                              val parts = entry.name.split("/").filter { it.isNotEmpty() }
+                              if (parts.size > stripComponents) {
+                                  val relPath = parts.drop(stripComponents).joinToString("/")
+                                  val outFile = File(destDir, relPath)
+                                  if (entry.isDirectory) {
+                                      outFile.mkdirs()
+                                  } else if (entry.isSymbolicLink) {
+                                      outFile.parentFile?.mkdirs()
+                                      outFile.delete()
+                                      try { Files.createSymbolicLink(outFile.toPath(), Paths.get(entry.linkName)) } catch (_: Exception) {}
+                                  } else {
+                                      outFile.parentFile?.mkdirs()
+                                      FileOutputStream(outFile).use { out -> tar.copyTo(out) }
+                                      if ((entry.mode and 0b001_000_000) != 0) outFile.setExecutable(true, false)
+                                  }
+                              }
+                              entry = tar.nextTarEntry
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
+          fi
+
+      - name: Fetch Genuine ARM64 libproot.so & libtalloc.so.2
         run: |
           mkdir -p app/src/main/jniLibs/arm64-v8a
           mkdir -p /tmp/proot-extract
@@ -41,12 +189,13 @@ jobs:
           cp data/data/com.termux/files/usr/lib/libtalloc.so.2 "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libtalloc.so.2"
           chmod 755 "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/"*.so*
 
-      - name: Setup Gradle & Build Signed Installable APK
+      - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
+
       - name: Assemble Standalone APK
         run: |
           gradle wrapper --gradle-version 8.7
-          ./gradlew assembleDebug
+          ./gradlew assembleDebug --stacktrace
 
       - name: Upload Installable Android APK Artifact
         uses: actions/upload-artifact@v4
