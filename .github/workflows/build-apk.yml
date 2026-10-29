@@ -297,6 +297,183 @@ jobs:
                           (header[2] == 'z'.code.toByte()) && (header[3] == 'X'.code.toByte()) &&
                           (header[4] == 'Z'.code.toByte()) && (header[5] == 0x00.toByte())
 
+                  val compStream: InputStream = when {
+                      isXz -> XZCompressorInputStream(pushback)
+                      isGz -> GzipCompressorInputStream(pushback)
+                      else -> pushback
+                  }
+
+                  TarArchiveInputStream(compStream).use { tar ->
+                      val standardDirs = setOf("bin", "sbin", "etc", "usr", "lib", "var", "dev", "proc", "sys", "root", "home", "tmp", "opt")
+                      var entry = tar.nextTarEntry
+                      var count = 0
+                      while (entry != null) {
+                          val cleanName = entry.name.trimStart('.', '/')
+                          if (cleanName.isNotEmpty()) {
+                              val parts = cleanName.split("/").filter { it.isNotEmpty() }
+                              val finalRelPath = if (parts.size > 1 && !standardDirs.contains(parts[0])) parts.drop(1).joinToString("/") else parts.joinToString("/")
+                              if (finalRelPath.isNotEmpty()) {
+                                  val outFile = File(destDir, finalRelPath)
+                                  if (entry.isDirectory) {
+                                      outFile.mkdirs()
+                                  } else if (entry.isSymbolicLink) {
+                                      outFile.parentFile?.mkdirs()
+                                      outFile.delete()
+                                      try { Files.createSymbolicLink(outFile.toPath(), Paths.get(entry.linkName)) } catch (_: Exception) {}
+                                  } else {
+                                      outFile.parentFile?.mkdirs()
+                                      FileOutputStream(outFile).use { out -> tar.copyTo(out) }
+                                      if ((entry.mode and 0b001_000_000) != 0) {
+                                          outFile.setExecutable(true, false)
+                                      }
+                                  }
+                              }
+                          }
+                          count++
+                          if (count % 3000 == 0) {
+                              onProgress("Extracted $count files...")
+                          }
+                          entry = tar.nextTarEntry
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: Fetch and Patch ARM64 Binaries (libproot, libtalloc, libandroid-shmem)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y patchelf
+
+          mkdir -p /tmp/debs
+          cd /tmp/debs
+
+          PACKAGES_URL="https://packages.termux.dev/apt/termux-main/dists/stable/main/binary-aarch64/Packages"
+          curl -sL "$PACKAGES_URL" -o Packages
+
+          PROOT_DEB_PATH=$(awk '/^Package: proot$/,/^$/' Packages | grep '^Filename:' | head -n 1 | awk '{print $2}')
+          TALLOC_DEB_PATH=$(awk '/^Package: libtalloc$/,/^$/' Packages | grep '^Filename:' | head -n 1 | awk '{print $2}')
+          SHMEM_DEB_PATH=$(awk '/^Package: libandroid-shmem$/,/^$/' Packages | grep '^Filename:' | head -n 1 | awk '{print $2}')
+
+          if [ -z "$SHMEM_DEB_PATH" ]; then
+            SHMEM_DEB_PATH=$(grep -E 'libandroid-shmem.*_aarch64\.deb' Packages | head -n 1 | awk '{print $2}')
+          fi
+
+          curl -sL "https://packages.termux.dev/apt/termux-main/$PROOT_DEB_PATH" -o proot.deb
+          curl -sL "https://packages.termux.dev/apt/termux-main/$TALLOC_DEB_PATH" -o talloc.deb
+          curl -sL "https://packages.termux.dev/apt/termux-main/$SHMEM_DEB_PATH" -o shmem.deb
+
+          mkdir -p extract
+          for f in proot.deb talloc.deb shmem.deb; do
+            mkdir -p "extract/$f"
+            cd "extract/$f"
+            ar x "/tmp/debs/$f"
+            tar -xf data.tar.*
+            cd /tmp/debs
+          done
+
+          DEST="$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a"
+          mkdir -p "$DEST"
+
+          TALLOC_SRC=$(find extract -name "libtalloc.so*" | head -n 1)
+          cp "$TALLOC_SRC" "$DEST/libtalloc.so"
+          patchelf --set-soname libtalloc.so "$DEST/libtalloc.so"
+          patchelf --set-rpath '$ORIGIN' "$DEST/libtalloc.so" || true
+
+          SHMEM_SRC=$(find extract -name "libandroid-shmem.so*" | head -n 1)
+          cp "$SHMEM_SRC" "$DEST/libandroid-shmem.so"
+          patchelf --set-soname libandroid-shmem.so "$DEST/libandroid-shmem.so"
+          patchelf --set-rpath '$ORIGIN' "$DEST/libandroid-shmem.so" || true
+
+          PROOT_SRC=$(find extract -path "*/usr/bin/proot" | head -n 1)
+          cp "$PROOT_SRC" "$DEST/libproot.so"
+          patchelf --replace-needed libtalloc.so.2 libtalloc.so "$DEST/libproot.so" || true
+          patchelf --set-rpath '$ORIGIN' "$DEST/libproot.so"
+
+          LOADER_SRC=$(find extract -path "*/libexec/proot/loader" | head -n 1)
+          cp "$LOADER_SRC" "$DEST/libproot-loader.so"
+
+          chmod 755 "$DEST/"*.so*
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Assemble Pre-Bundled Standalone APK
+        run: |
+          gradle wrapper --gradle-version 8.7
+          ./gradlew assembleDebug --stacktrace
+          cp app/build/outputs/apk/debug/app-debug.apk PocketVSCode-arm64.apk
+
+      - name: Publish Direct APK to GitHub Releases (No Zip)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RELEASE_TAG="v1.0.${{ github.run_number }}"
+          gh release create "$RELEASE_TAG" PocketVSCode-arm64.apk \
+            --target "${{ github.sha }}" \
+            --title "Pocket VS Code ($RELEASE_TAG)" \
+            --notes "Direct installable APK without zip extraction. Download PocketVSCode-arm64.apk below."
+
+      - name: Upload Artifact Backup
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pocket-VS-Code-arm64-v8a-APK
+          path: PocketVSCode-arm64.apk
+ager.rootfsDir, "opt/vscode-arm64")
+                      if (!File(vscodeDir, "bin/code").exists()) {
+                          vscodeDir.mkdirs()
+                          onProgress("2/3 Extracting Bundled Microsoft VS Code from APK (Offline)...")
+                          val assetList = context.assets.list("") ?: emptyArray()
+                          val vscodeAsset = assetList.firstOrNull { it.startsWith("vscode-linux-arm64") }
+                          if (vscodeAsset != null) {
+                              context.assets.open(vscodeAsset).use { input ->
+                                  extractTarFromStream(input, vscodeDir, onProgress)
+                              }
+                          } else {
+                              throw IOException("Pre-bundled vscode-linux-arm64 asset not found in APK!")
+                          }
+                      } else {
+                          onProgress("2/3 Official VS Code already installed.")
+                      }
+
+                      // 3. Configure Environment
+                      onProgress("3/3 Configuring Environment...")
+                      val p = prootManager.startProotCommand("bash /root/init-rootfs.sh", prootManager.homeDir.absolutePath, onLogLine = onProgress)
+                      val exit = p.waitFor()
+                      onProgress("Provisioning finished with code $exit")
+                      exit == 0
+                  } catch (e: Exception) {
+                      onProgress("ERROR during provisioning: ${e.message}")
+                      false
+                  }
+              }
+
+              fun exportAssetScripts() {
+                  val targetDir = File(prootManager.rootfsDir, "root").apply { mkdirs() }
+                  listOf("init-rootfs.sh", "start-vscode-session.sh", "verify-vscode.sh").forEach { name ->
+                      try {
+                          val outFile = File(targetDir, name)
+                          context.assets.open(name).use { input -> FileOutputStream(outFile).use { output -> input.copyTo(output) } }
+                          outFile.setExecutable(true, false)
+                      } catch (_: Exception) {}
+                  }
+              }
+
+              private fun extractTarFromStream(inputStream: InputStream, destDir: File, onProgress: (String) -> Unit) {
+                  val bufferedIn = BufferedInputStream(inputStream, 128 * 1024)
+                  val pushback = PushbackInputStream(bufferedIn, 512)
+                  val header = ByteArray(6)
+                  val n = pushback.read(header)
+                  if (n > 0) {
+                      pushback.unread(header, 0, n)
+                  }
+
+                  val isGz = n >= 2 && (header[0] == 0x1F.toByte()) && (header[1] == 0x8B.toByte())
+                  val isXz = n >= 6 && (header[0] == 0xFD.toByte()) && (header[1] == '7'.code.toByte()) &&
+                          (header[2] == 'z'.code.toByte()) && (header[3] == 'X'.code.toByte()) &&
+                          (header[4] == 'Z'.code.toByte()) && (header[5] == 0x00.toByte())
+
                   // Auto-switch: If already uncompressed by AssetManager, directly feed raw TAR stream
                   val compStream: InputStream = when {
                       isXz -> XZCompressorInputStream(pushback)
