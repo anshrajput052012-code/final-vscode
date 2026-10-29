@@ -5,12 +5,17 @@ on:
     branches: [ "main", "master" ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-arm64-apk:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Project Source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -60,6 +65,39 @@ jobs:
           kotlin.code.style=official
           android.nonTransitiveRClass=true
           EOF
+
+      - name: Setup Permanent Keystore for In-Place Updates
+        run: |
+          mkdir -p ~/.android
+          if [ -f "app/keystore.jks" ]; then
+            echo "Existing permanent keystore found in repository."
+            cp app/keystore.jks ~/.android/debug.keystore
+          else
+            echo "Generating new permanent keystore..."
+            keytool -genkeypair -v \
+              -keystore ~/.android/debug.keystore \
+              -alias androiddebugkey \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass android \
+              -keypass android \
+              -dname "CN=VSCodeStandalone, OU=Dev, O=Standalone, L=Bijnor, ST=UP, C=IN"
+            
+            mkdir -p app
+            cp ~/.android/debug.keystore app/keystore.jks
+            
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add app/keystore.jks
+            git commit -m "chore: commit permanent signing keystore for continuous seamless updates" || true
+            git push origin HEAD:${{ github.ref_name }} || true
+          fi
+
+      - name: Auto-Bump Version Code for Seamless Updates
+        run: |
+          find app -name "build.gradle.kts" -exec sed -i 's/versionCode = [0-9]*/versionCode = ${{ github.run_number }}/g' {} + || true
+          find app -name "build.gradle" -exec sed -i 's/versionCode [0-9]*/versionCode ${{ github.run_number }}/g' {} + || true
 
       - name: Fetch and Bundle Genuine Debian Rootfs into APK Assets
         env:
@@ -111,7 +149,49 @@ jobs:
           EOF
           ls -lh app/src/main/assets/
 
-      - name: Configure StandaloneProvisioner with Embedded Rootfs and Auto-Resume
+      - name: Generate Fixed Launch Script (Both Mode 1 & Mode 2)
+        run: |
+          mkdir -p app/src/main/assets
+          cat > app/src/main/assets/start-vscode-session.sh << 'EOF'
+          #!/bin/bash
+          export USER=root
+          export HOME=/root
+          export LANG=C.UTF-8
+          export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/vscode-arm64/bin:$PATH
+          mkdir -p /root/.config/Code /root/.vscode-server-data /root/Workspace /tmp
+          chmod 1777 /tmp
+
+          MODE="$1"
+
+          if [ "$MODE" = "direct" ]; then
+              echo "[start-vscode] Starting Official VS Code Native Workbench Host (code serve-web)..."
+              exec /opt/vscode-arm64/bin/code serve-web \
+                  --host 127.0.0.1 \
+                  --port 8080 \
+                  --without-connection-token \
+                  --accept-server-license-terms \
+                  --server-data-dir /root/.vscode-server-data
+          else
+              echo "[start-vscode] Starting TigerVNC + Openbox + VS Code Desktop (Mode 1)..."
+              pkill -f Xtigervnc || true
+              rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1
+              mkdir -p /root/.vnc
+              touch /root/.vnc/passwd
+
+              export DISPLAY=:1
+              Xtigervnc :1 -geometry 1280x720 -depth 24 -SecurityTypes None --I-KNOW-THIS-IS-INSECURE &
+              sleep 1
+              openbox &
+              sleep 1
+              exec /opt/vscode-arm64/code \
+                  --no-sandbox \
+                  --user-data-dir /root/.config/Code \
+                  /root/Workspace
+          fi
+          EOF
+          chmod 755 app/src/main/assets/start-vscode-session.sh
+
+      - name: Configure StandaloneProvisioner with Asset Auto-Sync
         run: |
           STANDALONE_PROV="app/src/main/java/com/vscode/desktop/standalone/StandaloneProvisioner.kt"
           mkdir -p "$(dirname "$STANDALONE_PROV")"
@@ -178,7 +258,7 @@ jobs:
                   }
               }
 
-              private fun exportAssetScripts() {
+              fun exportAssetScripts() {
                   val targetDir = File(prootManager.rootfsDir, "root").apply { mkdirs() }
                   listOf("init-rootfs.sh", "start-vscode-session.sh", "verify-vscode.sh").forEach { name ->
                       try {
