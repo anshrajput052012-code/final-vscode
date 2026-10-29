@@ -65,7 +65,14 @@ jobs:
           android.nonTransitiveRClass=true
           EOF
 
-          # 5. StandaloneProvisioner with robust HTTP 301/302/307 redirect follow & live MB progress
+          # 5. Find current active live Debian rootfs URL from official Termux repo
+          LIVE_DEBIAN_URL=$(curl -sL https://raw.githubusercontent.com/termux/proot-distro/master/distro-plugins/debian.sh | grep "TARBALL_URL\['aarch64'\]" | grep -o 'https://[^'\''"]*' | head -n 1)
+          if [ -z "$LIVE_DEBIAN_URL" ]; then
+            LIVE_DEBIAN_URL=$(curl -sL https://api.github.com/repos/termux/proot-distro/releases | grep -o 'https://github.com/termux/proot-distro/releases/download/[^"]*debian[^"]*aarch64[^"]*\.tar\.[a-z0-9]*' | head -n 1)
+          fi
+          echo "Discovered Live Debian URL: $LIVE_DEBIAN_URL"
+
+          # 6. StandaloneProvisioner with Live Mirror + Fallback system + Progress Tracker
           STANDALONE_PROV="app/src/main/java/com/vscode/desktop/standalone/StandaloneProvisioner.kt"
           mkdir -p "$(dirname "$STANDALONE_PROV")"
           cat > "$STANDALONE_PROV" << 'EOF'
@@ -83,19 +90,25 @@ jobs:
 
           class StandaloneProvisioner(private val context: Context, private val prootManager: ProotProcessManager) {
               companion object {
-                  const val DEBIAN_ROOTFS_URL = "https://github.com/termux/proot-distro/releases/download/v4.15.0/debian-bookworm-aarch64-pd-v4.15.0.tar.xz"
+                  val DEBIAN_ROOTFS_URLS = listOf(
+                      "@LIVE_DEBIAN_URL@",
+                      "https://github.com/termux/proot-distro/releases/download/v4.19.0/debian-bookworm-aarch64-pd-v4.19.0.tar.xz",
+                      "https://github.com/termux/proot-distro/releases/download/v4.18.0/debian-bookworm-aarch64-pd-v4.18.0.tar.xz",
+                      "https://github.com/termux/proot-distro/releases/download/v4.17.0/debian-bookworm-aarch64-pd-v4.17.0.tar.xz",
+                      "https://github.com/termux/proot-distro/releases/download/v4.16.0/debian-bookworm-aarch64-pd-v4.16.0.tar.xz"
+                  )
                   const val VSCODE_ARM64_URL = "https://update.code.visualstudio.com/latest/linux-arm64/stable"
               }
 
               fun provisionAll(onProgress: (String) -> Unit): Boolean {
                   return try {
                       exportAssetScripts()
-                      val rootfsTar = File(prootManager.tmpDir, "debian-arm64.tar.xz")
+                      val rootfsTar = File(prootManager.tmpDir, "debian-arm64-rootfs.tar")
                       if (!File(prootManager.rootfsDir, "bin/bash").exists()) {
                           onProgress("1/4 Downloading ARM64 Debian Rootfs...")
-                          downloadFile(DEBIAN_ROOTFS_URL, rootfsTar, onProgress)
+                          downloadWithFallbacks(DEBIAN_ROOTFS_URLS, rootfsTar, onProgress)
                           onProgress("2/4 Extracting Debian Rootfs...")
-                          extractTarArchive(rootfsTar, prootManager.rootfsDir, isXz = true, stripComponents = 1)
+                          extractTarArchive(rootfsTar, prootManager.rootfsDir)
                           rootfsTar.delete()
                       }
                       val vscodeDir = File(prootManager.rootfsDir, "opt/vscode-arm64")
@@ -105,7 +118,7 @@ jobs:
                           onProgress("3/4 Downloading Official Microsoft VS Code...")
                           downloadFile(VSCODE_ARM64_URL, vscodeTar, onProgress)
                           onProgress("4/4 Extracting Genuine VS Code...")
-                          extractTarArchive(vscodeTar, vscodeDir, isXz = false, stripComponents = 1)
+                          extractTarArchive(vscodeTar, vscodeDir)
                           vscodeTar.delete()
                       }
                       onProgress("Configuring Environment...")
@@ -128,6 +141,23 @@ jobs:
                   }
               }
 
+              private fun downloadWithFallbacks(urls: List<String>, destination: File, onProgress: (String) -> Unit) {
+                  var lastEx: Exception? = null
+                  for (candidate in urls) {
+                      if (candidate.isBlank() || candidate.startsWith("@")) continue
+                      try {
+                          onProgress("Connecting: $candidate")
+                          downloadFile(candidate, destination, onProgress)
+                          return
+                      } catch (e: Exception) {
+                          lastEx = e
+                          destination.delete()
+                          onProgress("Link unreachable (${e.message}), trying backup mirror...")
+                      }
+                  }
+                  throw (lastEx ?: IOException("All download mirrors failed."))
+              }
+
               private fun downloadFile(urlStr: String, destination: File, onProgress: (String) -> Unit) {
                   var currentUrl = urlStr
                   var redirects = 0
@@ -141,7 +171,7 @@ jobs:
                       if (code in listOf(301, 302, 303, 307, 308)) {
                           val loc = conn.getHeaderField("Location")
                           if (loc != null) {
-                              currentUrl = loc
+                              currentUrl = if (loc.startsWith("http://") || loc.startsWith("https://")) loc else URL(URL(currentUrl), loc).toString()
                               redirects++
                               continue
                           }
@@ -173,26 +203,51 @@ jobs:
                   throw IOException("Too many redirects: $currentUrl")
               }
 
-              private fun extractTarArchive(archiveFile: File, destDir: File, isXz: Boolean, stripComponents: Int) {
+              private fun isXzArchive(file: File): Boolean {
+                  return try {
+                      FileInputStream(file).use { fis ->
+                          val b = ByteArray(6)
+                          val r = fis.read(b)
+                          r >= 6 && b[0] == 0xFD.toByte() && b[1] == '7'.code.toByte() &&
+                                  b[2] == 'z'.code.toByte() && b[3] == 'X'.code.toByte() &&
+                                  b[4] == 'Z'.code.toByte() && b[5] == 0x00.toByte()
+                      }
+                  } catch (_: Exception) {
+                      false
+                  }
+              }
+
+              private fun extractTarArchive(archiveFile: File, destDir: File) {
+                  val isXz = isXzArchive(archiveFile)
                   FileInputStream(archiveFile).use { fis ->
-                      val comp = if (isXz) XZCompressorInputStream(BufferedInputStream(fis)) else GzipCompressorInputStream(BufferedInputStream(fis))
-                      TarArchiveInputStream(comp).use { tar ->
+                      val compStream = if (isXz) XZCompressorInputStream(BufferedInputStream(fis)) else GzipCompressorInputStream(BufferedInputStream(fis))
+                      TarArchiveInputStream(compStream).use { tar ->
+                          val standardDirs = setOf("bin", "sbin", "etc", "usr", "lib", "var", "dev", "proc", "sys", "root", "home", "tmp", "opt")
                           var entry = tar.nextTarEntry
                           while (entry != null) {
-                              val parts = entry.name.split("/").filter { it.isNotEmpty() }
-                              if (parts.size > stripComponents) {
-                                  val relPath = parts.drop(stripComponents).joinToString("/")
-                                  val outFile = File(destDir, relPath)
-                                  if (entry.isDirectory) {
-                                      outFile.mkdirs()
-                                  } else if (entry.isSymbolicLink) {
-                                      outFile.parentFile?.mkdirs()
-                                      outFile.delete()
-                                      try { Files.createSymbolicLink(outFile.toPath(), Paths.get(entry.linkName)) } catch (_: Exception) {}
+                              val cleanName = entry.name.trimStart('.', '/')
+                              if (cleanName.isNotEmpty()) {
+                                  val parts = cleanName.split("/").filter { it.isNotEmpty() }
+                                  val finalRelPath = if (parts.size > 1 && !standardDirs.contains(parts[0])) {
+                                      parts.drop(1).joinToString("/")
                                   } else {
-                                      outFile.parentFile?.mkdirs()
-                                      FileOutputStream(outFile).use { out -> tar.copyTo(out) }
-                                      if ((entry.mode and 0b001_000_000) != 0) outFile.setExecutable(true, false)
+                                      parts.joinToString("/")
+                                  }
+                                  if (finalRelPath.isNotEmpty()) {
+                                      val outFile = File(destDir, finalRelPath)
+                                      if (entry.isDirectory) {
+                                          outFile.mkdirs()
+                                      } else if (entry.isSymbolicLink) {
+                                          outFile.parentFile?.mkdirs()
+                                          outFile.delete()
+                                          try { Files.createSymbolicLink(outFile.toPath(), Paths.get(entry.linkName)) } catch (_: Exception) {}
+                                      } else {
+                                          outFile.parentFile?.mkdirs()
+                                          FileOutputStream(outFile).use { out -> tar.copyTo(out) }
+                                          if ((entry.mode and 0b001_000_000) != 0) {
+                                              outFile.setExecutable(true, false)
+                                          }
+                                      }
                                   }
                               }
                               entry = tar.nextTarEntry
@@ -202,6 +257,17 @@ jobs:
               }
           }
           EOF
+
+          # Inject the verified live URL into the source code
+          python3 -c "
+          path = '$STANDALONE_PROV'
+          url = '$LIVE_DEBIAN_URL'
+          with open(path, 'r') as f:
+              c = f.read()
+          c = c.replace('@LIVE_DEBIAN_URL@', url)
+          with open(path, 'w') as f:
+              f.write(c)
+          "
 
       - name: Fetch Genuine ARM64 libproot.so & libtalloc.so.2
         run: |
