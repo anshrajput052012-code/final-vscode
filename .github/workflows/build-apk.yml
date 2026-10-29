@@ -29,7 +29,7 @@ jobs:
             fi
           done
 
-          # 2. Generate missing root settings.gradle.kts
+          # 2. Generate root settings.gradle.kts
           cat > settings.gradle.kts << 'EOF'
           pluginManagement {
               repositories {
@@ -49,7 +49,7 @@ jobs:
           include(":app")
           EOF
 
-          # 3. Generate missing root build.gradle.kts
+          # 3. Generate root build.gradle.kts
           cat > build.gradle.kts << 'EOF'
           plugins {
               id("com.android.application") version "8.5.2" apply false
@@ -57,7 +57,7 @@ jobs:
           }
           EOF
 
-          # 4. Generate missing root gradle.properties
+          # 4. Generate root gradle.properties
           cat > gradle.properties << 'EOF'
           org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8
           android.useAndroidX=true
@@ -65,11 +65,10 @@ jobs:
           android.nonTransitiveRClass=true
           EOF
 
-          # 5. Ensure StandaloneProvisioner.kt exists
+          # 5. StandaloneProvisioner with robust HTTP 301/302/307 redirect follow & live MB progress
           STANDALONE_PROV="app/src/main/java/com/vscode/desktop/standalone/StandaloneProvisioner.kt"
-          if [ ! -f "$STANDALONE_PROV" ]; then
-            mkdir -p "$(dirname "$STANDALONE_PROV")"
-            cat > "$STANDALONE_PROV" << 'EOF'
+          mkdir -p "$(dirname "$STANDALONE_PROV")"
+          cat > "$STANDALONE_PROV" << 'EOF'
           package com.vscode.desktop.standalone
 
           import android.content.Context
@@ -93,9 +92,9 @@ jobs:
                       exportAssetScripts()
                       val rootfsTar = File(prootManager.tmpDir, "debian-arm64.tar.xz")
                       if (!File(prootManager.rootfsDir, "bin/bash").exists()) {
-                          onProgress("Downloading ARM64 Debian Rootfs...")
+                          onProgress("1/4 Downloading ARM64 Debian Rootfs...")
                           downloadFile(DEBIAN_ROOTFS_URL, rootfsTar, onProgress)
-                          onProgress("Extracting Rootfs...")
+                          onProgress("2/4 Extracting Debian Rootfs...")
                           extractTarArchive(rootfsTar, prootManager.rootfsDir, isXz = true, stripComponents = 1)
                           rootfsTar.delete()
                       }
@@ -103,17 +102,19 @@ jobs:
                       if (!File(vscodeDir, "bin/code").exists()) {
                           vscodeDir.mkdirs()
                           val vscodeTar = File(prootManager.tmpDir, "vscode-linux-arm64.tar.gz")
-                          onProgress("Downloading Official Microsoft VS Code...")
+                          onProgress("3/4 Downloading Official Microsoft VS Code...")
                           downloadFile(VSCODE_ARM64_URL, vscodeTar, onProgress)
-                          onProgress("Extracting VS Code...")
+                          onProgress("4/4 Extracting Genuine VS Code...")
                           extractTarArchive(vscodeTar, vscodeDir, isXz = false, stripComponents = 1)
                           vscodeTar.delete()
                       }
                       onProgress("Configuring Environment...")
                       val p = prootManager.startProotCommand("bash /root/init-rootfs.sh", prootManager.homeDir.absolutePath, onLogLine = onProgress)
-                      p.waitFor() == 0
+                      val exit = p.waitFor()
+                      onProgress("Provisioning finished with code $exit")
+                      exit == 0
                   } catch (e: Exception) {
-                      onProgress("ERROR: ${e.message}")
+                      onProgress("ERROR during provisioning: ${e.message}")
                       false
                   }
               }
@@ -128,11 +129,48 @@ jobs:
               }
 
               private fun downloadFile(urlStr: String, destination: File, onProgress: (String) -> Unit) {
-                  val conn = URL(urlStr).openConnection() as HttpURLConnection
-                  conn.instanceFollowRedirects = true
-                  BufferedInputStream(conn.inputStream).use { input ->
-                      FileOutputStream(destination).use { output -> input.copyTo(output) }
+                  var currentUrl = urlStr
+                  var redirects = 0
+                  while (redirects < 10) {
+                      val conn = URL(currentUrl).openConnection() as HttpURLConnection
+                      conn.instanceFollowRedirects = false
+                      conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36")
+                      conn.connectTimeout = 30000
+                      conn.readTimeout = 30000
+                      val code = conn.responseCode
+                      if (code in listOf(301, 302, 303, 307, 308)) {
+                          val loc = conn.getHeaderField("Location")
+                          if (loc != null) {
+                              currentUrl = loc
+                              redirects++
+                              continue
+                          }
+                      }
+                      if (code != 200) {
+                          throw IOException("HTTP $code on $currentUrl")
+                      }
+                      val totalBytes = conn.contentLengthLong
+                      BufferedInputStream(conn.inputStream).use { input ->
+                          FileOutputStream(destination).use { output ->
+                              val buffer = ByteArray(64 * 1024)
+                              var downloaded = 0L
+                              var read: Int
+                              var lastMb = -1L
+                              while (input.read(buffer).also { read = it } != -1) {
+                                  output.write(buffer, 0, read)
+                                  downloaded += read
+                                  val mb = downloaded / (1024 * 1024)
+                                  if (mb != lastMb && mb % 5L == 0L) {
+                                      lastMb = mb
+                                      val totalMb = if (totalBytes > 0) "${totalBytes / (1024 * 1024)} MB" else "..."
+                                      onProgress("Downloaded $mb MB / $totalMb...")
+                                  }
+                              }
+                          }
+                      }
+                      return
                   }
+                  throw IOException("Too many redirects: $currentUrl")
               }
 
               private fun extractTarArchive(archiveFile: File, destDir: File, isXz: Boolean, stripComponents: Int) {
@@ -164,7 +202,6 @@ jobs:
               }
           }
           EOF
-          fi
 
       - name: Fetch Genuine ARM64 libproot.so & libtalloc.so.2
         run: |
