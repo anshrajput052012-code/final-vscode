@@ -1,4 +1,4 @@
-name: Build Standalone VS Code Android APK (Zero Termux)
+name: Build Standalone VS Code APK
 
 on:
   push:
@@ -23,7 +23,7 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Auto-Fix Folder Structure & Generate Root Configs
+      - name: Generate Root Configs
         run: |
           for f in app__*; do
             if [ -f "$f" ]; then
@@ -66,36 +66,21 @@ jobs:
           android.nonTransitiveRClass=true
           EOF
 
-      - name: Setup Permanent Keystore for Seamless Updates
+      - name: Setup Permanent Keystore and Version
         run: |
           mkdir -p ~/.android
           if [ -f "app/keystore.jks" ]; then
-            echo "Existing permanent keystore found in repository."
             cp app/keystore.jks ~/.android/debug.keystore
           else
-            echo "Generating new permanent keystore..."
-            keytool -genkeypair -v \
-              -keystore ~/.android/debug.keystore \
-              -alias androiddebugkey \
-              -keyalg RSA \
-              -keysize 2048 \
-              -validity 10000 \
-              -storepass android \
-              -keypass android \
-              -dname "CN=PocketVSCode, OU=Dev, O=Standalone, L=Bijnor, ST=UP, C=IN"
-            
+            keytool -genkeypair -v -keystore ~/.android/debug.keystore -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=PocketVSCode, OU=Dev, O=Standalone, L=Bijnor, ST=UP, C=IN"
             mkdir -p app
             cp ~/.android/debug.keystore app/keystore.jks
-            
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add app/keystore.jks
-            git commit -m "chore: save permanent keystore for seamless updates" || true
+            git commit -m "chore: save permanent keystore" || true
             git push origin HEAD:${{ github.ref_name }} || true
           fi
-
-      - name: Auto-Bump Version Code
-        run: |
           find app -name "build.gradle.kts" -exec sed -i 's/versionCode = [0-9]*/versionCode = ${{ github.run_number }}/g' {} + || true
           find app -name "build.gradle" -exec sed -i 's/versionCode [0-9]*/versionCode ${{ github.run_number }}/g' {} + || true
 
@@ -107,63 +92,51 @@ jobs:
               <string name="app_name">Pocket VS Code</string>
           </resources>
           EOF
-
           find app/src/main -name "AndroidManifest.xml" -exec sed -i 's/android:label="[^"]*"/android:label="@string\/app_name"/g' {} + || true
 
-      - name: Pre-Bundle Both Debian Rootfs AND Official VS Code into APK Assets
+      - name: Pre-Bundle Debian Rootfs and Official VS Code
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p app/src/main/assets
-
           python3 - << 'EOF'
           import urllib.request, json, subprocess, os, sys
-
           urls = []
           try:
               res = subprocess.run(["gh", "api", "repos/termux/proot-distro/releases?per_page=100"], capture_output=True, text=True)
-              releases = json.loads(res.stdout)
-              for rel in releases:
+              for rel in json.loads(res.stdout):
                   for asset in rel.get("assets", []):
-                      name = asset.get("name", "")
-                      if "debian" in name and "aarch64" in name and ("tar.xz" in name or "tar.gz" in name):
+                      n = asset.get("name", "")
+                      if "debian" in n and "aarch64" in n and ("tar.xz" in n or "tar.gz" in n):
                           urls.append(asset.get("browser_download_url"))
-          except Exception as e:
-              print("GH API Note:", e)
-
+          except Exception:
+              pass
           urls.append("https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/dist-arm64v8/bookworm/rootfs.tar.xz")
           urls.append("http://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04-base-arm64.tar.gz")
-
-          downloaded = False
-          for url in urls:
-              print(f"Fetching Rootfs: {url}")
+          ok = False
+          for u in urls:
               try:
-                  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                  with urllib.request.urlopen(req, timeout=60) as resp:
-                      if resp.status in (200, 302):
-                          ext = ".xz" if "xz" in url else ".gz"
-                          dest = f"app/src/main/assets/debian-rootfs.tar{ext}"
-                          with open(dest, "wb") as f:
-                              while True:
-                                  chunk = resp.read(1024 * 1024)
-                                  if not chunk: break
-                                  f.write(chunk)
-                          if os.path.getsize(dest) > 10 * 1024 * 1024:
-                              print(f"Bundled Rootfs: {dest}")
-                              downloaded = True
-                              break
-              except Exception as e:
-                  print(f"Skipping: {e}")
-
-          if not downloaded:
+                  req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      ext = ".xz" if "xz" in u else ".gz"
+                      dest = f"app/src/main/assets/debian-rootfs.tar{ext}"
+                      with open(dest, "wb") as f:
+                          while True:
+                              c = r.read(1024 * 1024)
+                              if not c: break
+                              f.write(c)
+                      if os.path.getsize(dest) > 10 * 1024 * 1024:
+                          ok = True
+                          break
+              except Exception:
+                  pass
+          if not ok:
               sys.exit(1)
           EOF
-
-          echo "Downloading VS Code ARM64..."
           curl -fSL -H "User-Agent: Mozilla/5.0" "https://update.code.visualstudio.com/latest/linux-arm64/stable" -o app/src/main/assets/vscode-linux-arm64.tar.gz
           ls -lh app/src/main/assets/
 
-      - name: Generate Fixed Launch Scripts (Both Mode 1 & Mode 2)
+      - name: Generate Fixed Launch Scripts
         run: |
           mkdir -p app/src/main/assets
           cat > app/src/main/assets/start-vscode-session.sh << 'EOF'
@@ -174,38 +147,27 @@ jobs:
           export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/vscode-arm64/bin:$PATH
           mkdir -p /root/.config/Code /root/.vscode-server-data /root/Workspace /tmp
           chmod 1777 /tmp
-
           MODE="$1"
-
           if [ "$MODE" = "direct" ]; then
               echo "[start-vscode] Starting Official VS Code Native Workbench Host (code serve-web)..."
-              exec /opt/vscode-arm64/bin/code serve-web \
-                  --host 127.0.0.1 \
-                  --port 8080 \
-                  --without-connection-token \
-                  --accept-server-license-terms \
-                  --server-data-dir /root/.vscode-server-data
+              exec /opt/vscode-arm64/bin/code serve-web --host 127.0.0.1 --port 8080 --without-connection-token --accept-server-license-terms --server-data-dir /root/.vscode-server-data
           else
               echo "[start-vscode] Starting TigerVNC + Openbox + VS Code Desktop (Mode 1)..."
               pkill -f Xtigervnc || true
               rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1
               mkdir -p /root/.vnc
               touch /root/.vnc/passwd
-
               export DISPLAY=:1
               Xtigervnc :1 -geometry 1920x1080 -depth 24 -SecurityTypes None --I-KNOW-THIS-IS-INSECURE &
               sleep 1
               openbox &
               sleep 1
-              exec /opt/vscode-arm64/code \
-                  --no-sandbox \
-                  --user-data-dir /root/.config/Code \
-                  /root/Workspace
+              exec /opt/vscode-arm64/code --no-sandbox --user-data-dir /root/.config/Code /root/Workspace
           fi
           EOF
           chmod 755 app/src/main/assets/start-vscode-session.sh
 
-      - name: Configure StandaloneProvisioner (Universal Magic-Header Unpacker)
+      - name: Configure Universal Asset Unpacker
         run: |
           STANDALONE_PROV="app/src/main/java/com/vscode/desktop/standalone/StandaloneProvisioner.kt"
           mkdir -p "$(dirname "$STANDALONE_PROV")"
@@ -225,42 +187,32 @@ jobs:
               fun provisionAll(onProgress: (String) -> Unit): Boolean {
                   return try {
                       exportAssetScripts()
-
-                      // 1. Unpack Debian Rootfs
                       if (!File(prootManager.rootfsDir, "bin/bash").exists()) {
                           onProgress("1/3 Extracting Bundled Debian Rootfs from APK (Offline)...")
                           val assetList = context.assets.list("") ?: emptyArray()
                           val rootfsAsset = assetList.firstOrNull { it.startsWith("debian-rootfs.tar") }
-                          if (rootfsAsset != null) {
-                              context.assets.open(rootfsAsset).use { input ->
-                                  extractTarFromStream(input, prootManager.rootfsDir, onProgress)
-                              }
-                          } else {
-                              throw IOException("Pre-bundled debian-rootfs asset not found in APK!")
+                              ?: throw IOException("Pre-bundled debian-rootfs asset not found!")
+                          context.assets.open(rootfsAsset).use { input ->
+                              extractTarFromStream(input, prootManager.rootfsDir, onProgress)
                           }
                       } else {
                           onProgress("1/3 Debian Rootfs already installed.")
                       }
 
-                      // 2. Unpack VS Code
                       val vscodeDir = File(prootManager.rootfsDir, "opt/vscode-arm64")
                       if (!File(vscodeDir, "bin/code").exists()) {
                           vscodeDir.mkdirs()
                           onProgress("2/3 Extracting Bundled Microsoft VS Code from APK (Offline)...")
                           val assetList = context.assets.list("") ?: emptyArray()
                           val vscodeAsset = assetList.firstOrNull { it.startsWith("vscode-linux-arm64") }
-                          if (vscodeAsset != null) {
-                              context.assets.open(vscodeAsset).use { input ->
-                                  extractTarFromStream(input, vscodeDir, onProgress)
-                              }
-                          } else {
-                              throw IOException("Pre-bundled vscode-linux-arm64 asset not found in APK!")
+                              ?: throw IOException("Pre-bundled vscode-linux-arm64 asset not found!")
+                          context.assets.open(vscodeAsset).use { input ->
+                              extractTarFromStream(input, vscodeDir, onProgress)
                           }
                       } else {
                           onProgress("2/3 Official VS Code already installed.")
                       }
 
-                      // 3. Configure Environment
                       onProgress("3/3 Configuring Environment...")
                       val p = prootManager.startProotCommand("bash /root/init-rootfs.sh", prootManager.homeDir.absolutePath, onLogLine = onProgress)
                       val exit = p.waitFor()
@@ -288,9 +240,7 @@ jobs:
                   val pushback = PushbackInputStream(bufferedIn, 512)
                   val header = ByteArray(6)
                   val n = pushback.read(header)
-                  if (n > 0) {
-                      pushback.unread(header, 0, n)
-                  }
+                  if (n > 0) pushback.unread(header, 0, n)
 
                   val isGz = n >= 2 && (header[0] == 0x1F.toByte()) && (header[1] == 0x8B.toByte())
                   val isXz = n >= 6 && (header[0] == 0xFD.toByte()) && (header[1] == '7'.code.toByte()) &&
@@ -330,9 +280,7 @@ jobs:
                               }
                           }
                           count++
-                          if (count % 3000 == 0) {
-                              onProgress("Extracted $count files...")
-                          }
+                          if (count % 3000 == 0) onProgress("Extracted $count files...")
                           entry = tar.nextTarEntry
                       }
                   }
@@ -340,29 +288,23 @@ jobs:
           }
           EOF
 
-      - name: Fetch and Patch ARM64 Binaries (libproot, libtalloc, libandroid-shmem)
+      - name: Fetch and Patch ARM64 Binaries
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y patchelf
-
           mkdir -p /tmp/debs
           cd /tmp/debs
-
           PACKAGES_URL="https://packages.termux.dev/apt/termux-main/dists/stable/main/binary-aarch64/Packages"
           curl -sL "$PACKAGES_URL" -o Packages
-
           PROOT_DEB_PATH=$(awk '/^Package: proot$/,/^$/' Packages | grep '^Filename:' | head -n 1 | awk '{print $2}')
           TALLOC_DEB_PATH=$(awk '/^Package: libtalloc$/,/^$/' Packages | grep '^Filename:' | head -n 1 | awk '{print $2}')
           SHMEM_DEB_PATH=$(awk '/^Package: libandroid-shmem$/,/^$/' Packages | grep '^Filename:' | head -n 1 | awk '{print $2}')
-
           if [ -z "$SHMEM_DEB_PATH" ]; then
             SHMEM_DEB_PATH=$(grep -E 'libandroid-shmem.*_aarch64\.deb' Packages | head -n 1 | awk '{print $2}')
           fi
-
           curl -sL "https://packages.termux.dev/apt/termux-main/$PROOT_DEB_PATH" -o proot.deb
           curl -sL "https://packages.termux.dev/apt/termux-main/$TALLOC_DEB_PATH" -o talloc.deb
           curl -sL "https://packages.termux.dev/apt/termux-main/$SHMEM_DEB_PATH" -o shmem.deb
-
           mkdir -p extract
           for f in proot.deb talloc.deb shmem.deb; do
             mkdir -p "extract/$f"
@@ -371,48 +313,39 @@ jobs:
             tar -xf data.tar.*
             cd /tmp/debs
           done
-
           DEST="$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a"
           mkdir -p "$DEST"
-
           TALLOC_SRC=$(find extract -name "libtalloc.so*" | head -n 1)
           cp "$TALLOC_SRC" "$DEST/libtalloc.so"
           patchelf --set-soname libtalloc.so "$DEST/libtalloc.so"
           patchelf --set-rpath '$ORIGIN' "$DEST/libtalloc.so" || true
-
           SHMEM_SRC=$(find extract -name "libandroid-shmem.so*" | head -n 1)
           cp "$SHMEM_SRC" "$DEST/libandroid-shmem.so"
           patchelf --set-soname libandroid-shmem.so "$DEST/libandroid-shmem.so"
           patchelf --set-rpath '$ORIGIN' "$DEST/libandroid-shmem.so" || true
-
           PROOT_SRC=$(find extract -path "*/usr/bin/proot" | head -n 1)
           cp "$PROOT_SRC" "$DEST/libproot.so"
           patchelf --replace-needed libtalloc.so.2 libtalloc.so "$DEST/libproot.so" || true
           patchelf --set-rpath '$ORIGIN' "$DEST/libproot.so"
-
           LOADER_SRC=$(find extract -path "*/libexec/proot/loader" | head -n 1)
           cp "$LOADER_SRC" "$DEST/libproot-loader.so"
-
           chmod 755 "$DEST/"*.so*
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
 
-      - name: Assemble Pre-Bundled Standalone APK
+      - name: Assemble Standalone APK
         run: |
           gradle wrapper --gradle-version 8.7
           ./gradlew assembleDebug --stacktrace
           cp app/build/outputs/apk/debug/app-debug.apk PocketVSCode-arm64.apk
 
-      - name: Publish Direct APK to GitHub Releases (No Zip)
+      - name: Publish Direct APK to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           RELEASE_TAG="v1.0.${{ github.run_number }}"
-          gh release create "$RELEASE_TAG" PocketVSCode-arm64.apk \
-            --target "${{ github.sha }}" \
-            --title "Pocket VS Code ($RELEASE_TAG)" \
-            --notes "Direct installable APK without zip extraction. Download PocketVSCode-arm64.apk below."
+          gh release create "$RELEASE_TAG" PocketVSCode-arm64.apk --target "${{ github.sha }}" --title "Pocket VS Code ($RELEASE_TAG)" --notes "Direct installable APK without zip extraction."
 
       - name: Upload Artifact Backup
         if: always()
@@ -420,180 +353,4 @@ jobs:
         with:
           name: Pocket-VS-Code-arm64-v8a-APK
           path: PocketVSCode-arm64.apk
-ager.rootfsDir, "opt/vscode-arm64")
-                      if (!File(vscodeDir, "bin/code").exists()) {
-                          vscodeDir.mkdirs()
-                          onProgress("2/3 Extracting Bundled Microsoft VS Code from APK (Offline)...")
-                          val assetList = context.assets.list("") ?: emptyArray()
-                          val vscodeAsset = assetList.firstOrNull { it.startsWith("vscode-linux-arm64") }
-                          if (vscodeAsset != null) {
-                              context.assets.open(vscodeAsset).use { input ->
-                                  extractTarFromStream(input, vscodeDir, onProgress)
-                              }
-                          } else {
-                              throw IOException("Pre-bundled vscode-linux-arm64 asset not found in APK!")
-                          }
-                      } else {
-                          onProgress("2/3 Official VS Code already installed.")
-                      }
-
-                      // 3. Configure Environment
-                      onProgress("3/3 Configuring Environment...")
-                      val p = prootManager.startProotCommand("bash /root/init-rootfs.sh", prootManager.homeDir.absolutePath, onLogLine = onProgress)
-                      val exit = p.waitFor()
-                      onProgress("Provisioning finished with code $exit")
-                      exit == 0
-                  } catch (e: Exception) {
-                      onProgress("ERROR during provisioning: ${e.message}")
-                      false
-                  }
-              }
-
-              fun exportAssetScripts() {
-                  val targetDir = File(prootManager.rootfsDir, "root").apply { mkdirs() }
-                  listOf("init-rootfs.sh", "start-vscode-session.sh", "verify-vscode.sh").forEach { name ->
-                      try {
-                          val outFile = File(targetDir, name)
-                          context.assets.open(name).use { input -> FileOutputStream(outFile).use { output -> input.copyTo(output) } }
-                          outFile.setExecutable(true, false)
-                      } catch (_: Exception) {}
-                  }
-              }
-
-              private fun extractTarFromStream(inputStream: InputStream, destDir: File, onProgress: (String) -> Unit) {
-                  val bufferedIn = BufferedInputStream(inputStream, 128 * 1024)
-                  val pushback = PushbackInputStream(bufferedIn, 512)
-                  val header = ByteArray(6)
-                  val n = pushback.read(header)
-                  if (n > 0) {
-                      pushback.unread(header, 0, n)
-                  }
-
-                  val isGz = n >= 2 && (header[0] == 0x1F.toByte()) && (header[1] == 0x8B.toByte())
-                  val isXz = n >= 6 && (header[0] == 0xFD.toByte()) && (header[1] == '7'.code.toByte()) &&
-                          (header[2] == 'z'.code.toByte()) && (header[3] == 'X'.code.toByte()) &&
-                          (header[4] == 'Z'.code.toByte()) && (header[5] == 0x00.toByte())
-
-                  // Auto-switch: If already uncompressed by AssetManager, directly feed raw TAR stream
-                  val compStream: InputStream = when {
-                      isXz -> XZCompressorInputStream(pushback)
-                      isGz -> GzipCompressorInputStream(pushback)
-                      else -> pushback
-                  }
-
-                  TarArchiveInputStream(compStream).use { tar ->
-                      val standardDirs = setOf("bin", "sbin", "etc", "usr", "lib", "var", "dev", "proc", "sys", "root", "home", "tmp", "opt")
-                      var entry = tar.nextTarEntry
-                      var count = 0
-                      while (entry != null) {
-                          val cleanName = entry.name.trimStart('.', '/')
-                          if (cleanName.isNotEmpty()) {
-                              val parts = cleanName.split("/").filter { it.isNotEmpty() }
-                              val finalRelPath = if (parts.size > 1 && !standardDirs.contains(parts[0])) parts.drop(1).joinToString("/") else parts.joinToString("/")
-                              if (finalRelPath.isNotEmpty()) {
-                                  val outFile = File(destDir, finalRelPath)
-                                  if (entry.isDirectory) {
-                                      outFile.mkdirs()
-                                  } else if (entry.isSymbolicLink) {
-                                      outFile.parentFile?.mkdirs()
-                                      outFile.delete()
-                                      try { Files.createSymbolicLink(outFile.toPath(), Paths.get(entry.linkName)) } catch (_: Exception) {}
-                                  } else {
-                                      outFile.parentFile?.mkdirs()
-                                      FileOutputStream(outFile).use { out -> tar.copyTo(out) }
-                                      if ((entry.mode and 0b001_000_000) != 0) {
-                                          outFile.setExecutable(true, false)
-                                      }
-                                  }
-                              }
-                          }
-                          count++
-                          if (count % 3000 == 0) {
-                              onProgress("Extracted $count files...")
-                          }
-                          entry = tar.nextTarEntry
-                      }
-                  }
-              }
-          }
-          EOF
-
-      - name: Fetch and Patch ARM64 Binaries (libproot, libtalloc, libandroid-shmem)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y patchelf
-
-          mkdir -p /tmp/debs
-          cd /tmp/debs
-
-          PACKAGES_URL="https://packages.termux.dev/apt/termux-main/dists/stable/main/binary-aarch64/Packages"
-          curl -sL "$PACKAGES_URL" -o Packages
-
-          PROOT_DEB_PATH=$(awk '/^Package: proot$/,/^$/' Packages | grep '^Filename:' | head -n 1 | awk '{print $2}')
-          TALLOC_DEB_PATH=$(awk '/^Package: libtalloc$/,/^$/' Packages | grep '^Filename:' | head -n 1 | awk '{print $2}')
-          SHMEM_DEB_PATH=$(awk '/^Package: libandroid-shmem$/,/^$/' Packages | grep '^Filename:' | head -n 1 | awk '{print $2}')
-
-          if [ -z "$SHMEM_DEB_PATH" ]; then
-            SHMEM_DEB_PATH=$(grep -E 'libandroid-shmem.*_aarch64\.deb' Packages | head -n 1 | awk '{print $2}')
-          fi
-
-          curl -sL "https://packages.termux.dev/apt/termux-main/$PROOT_DEB_PATH" -o proot.deb
-          curl -sL "https://packages.termux.dev/apt/termux-main/$TALLOC_DEB_PATH" -o talloc.deb
-          curl -sL "https://packages.termux.dev/apt/termux-main/$SHMEM_DEB_PATH" -o shmem.deb
-
-          mkdir -p extract
-          for f in proot.deb talloc.deb shmem.deb; do
-            mkdir -p "extract/$f"
-            cd "extract/$f"
-            ar x "/tmp/debs/$f"
-            tar -xf data.tar.*
-            cd /tmp/debs
-          done
-
-          DEST="$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a"
-          mkdir -p "$DEST"
-
-          TALLOC_SRC=$(find extract -name "libtalloc.so*" | head -n 1)
-          cp "$TALLOC_SRC" "$DEST/libtalloc.so"
-          patchelf --set-soname libtalloc.so "$DEST/libtalloc.so"
-          patchelf --set-rpath '$ORIGIN' "$DEST/libtalloc.so" || true
-
-          SHMEM_SRC=$(find extract -name "libandroid-shmem.so*" | head -n 1)
-          cp "$SHMEM_SRC" "$DEST/libandroid-shmem.so"
-          patchelf --set-soname libandroid-shmem.so "$DEST/libandroid-shmem.so"
-          patchelf --set-rpath '$ORIGIN' "$DEST/libandroid-shmem.so" || true
-
-          PROOT_SRC=$(find extract -path "*/usr/bin/proot" | head -n 1)
-          cp "$PROOT_SRC" "$DEST/libproot.so"
-          patchelf --replace-needed libtalloc.so.2 libtalloc.so "$DEST/libproot.so" || true
-          patchelf --set-rpath '$ORIGIN' "$DEST/libproot.so"
-
-          LOADER_SRC=$(find extract -path "*/libexec/proot/loader" | head -n 1)
-          cp "$LOADER_SRC" "$DEST/libproot-loader.so"
-
-          chmod 755 "$DEST/"*.so*
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-
-      - name: Assemble Pre-Bundled Standalone APK
-        run: |
-          gradle wrapper --gradle-version 8.7
-          ./gradlew assembleDebug --stacktrace
-          cp app/build/outputs/apk/debug/app-debug.apk PocketVSCode-arm64.apk
-
-      - name: Publish Direct APK to GitHub Releases (No Zip)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release delete continuous -y || true
-          git push origin :refs/tags/continuous || true
-          gh release create continuous PocketVSCode-arm64.apk \
-            --title "Pocket VS Code Latest Build" \
-            --notes "Direct installable APK without zip extraction. Download PocketVSCode-arm64.apk below."
-
-      - name: Upload Artifact Backup
-        uses: actions/upload-artifact@v4
-        with:
-          name: Pocket-VS-Code-arm64-v8a-APK
-          path: PocketVSCode-arm64.apk
+          
