@@ -82,7 +82,7 @@ jobs:
               -validity 10000 \
               -storepass android \
               -keypass android \
-              -dname "CN=VSCodeStandalone, OU=Dev, O=Standalone, L=Bijnor, ST=UP, C=IN"
+              -dname "CN=PocketVSCode, OU=Dev, O=Standalone, L=Bijnor, ST=UP, C=IN"
             
             mkdir -p app
             cp ~/.android/debug.keystore app/keystore.jks
@@ -98,6 +98,52 @@ jobs:
         run: |
           find app -name "build.gradle.kts" -exec sed -i 's/versionCode = [0-9]*/versionCode = ${{ github.run_number }}/g' {} + || true
           find app -name "build.gradle" -exec sed -i 's/versionCode [0-9]*/versionCode ${{ github.run_number }}/g' {} + || true
+
+      - name: Set App Name to 'Pocket VS Code' and Generate Launcher Icons
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y python3-pil
+
+          # 1. Set App Title in strings.xml
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml << 'EOF'
+          <resources>
+              <string name="app_name">Pocket VS Code</string>
+          </resources>
+          EOF
+
+          # Ensure AndroidManifest references @string/app_name and launcher icons
+          find app/src/main -name "AndroidManifest.xml" -exec sed -i 's/android:label="[^"]*"/android:label="@string\/app_name"/g' {} + || true
+          find app/src/main -name "AndroidManifest.xml" -exec sed -i 's/android:icon="[^"]*"/android:icon="@mipmap\/ic_launcher"/g' {} + || true
+          find app/src/main -name "AndroidManifest.xml" -exec sed -i 's/android:roundIcon="[^"]*"/android:roundIcon="@mipmap\/ic_launcher_round"/g' {} + || true
+
+          # 2. Download Official VS Code Icon and create all Android Mipmaps
+          python3 - << 'EOF'
+          import urllib.request, os
+          from PIL import Image
+
+          icon_url = "https://raw.githubusercontent.com/microsoft/vscode/main/resources/linux/code.png"
+          urllib.request.urlretrieve(icon_url, "vscode_icon.png")
+
+          img = Image.open("vscode_icon.png").convert("RGBA")
+
+          sizes = {
+              "mipmap-mdpi": 48,
+              "mipmap-hdpi": 72,
+              "mipmap-xhdpi": 96,
+              "mipmap-xxhdpi": 144,
+              "mipmap-xxxhdpi": 192
+          }
+
+          for folder, size in sizes.items():
+              dest_dir = os.path.join("app/src/main/res", folder)
+              os.makedirs(dest_dir, exist_ok=True)
+              resized = img.resize((size, size), Image.Resampling.LANCZOS)
+              resized.save(os.path.join(dest_dir, "ic_launcher.png"))
+              resized.save(os.path.join(dest_dir, "ic_launcher_round.png"))
+
+          print("Generated Pocket VS Code icons across all densities.")
+          EOF
 
       - name: Pre-Bundle Both Debian Rootfs AND Official VS Code into APK Assets
         env:
@@ -155,7 +201,7 @@ jobs:
           echo "Pre-bundled assets ready:"
           ls -lh app/src/main/assets/
 
-      - name: Generate Fixed Launch Scripts
+      - name: Generate Fixed Launch Scripts (Both Mode 1 & Mode 2)
         run: |
           mkdir -p app/src/main/assets
           cat > app/src/main/assets/start-vscode-session.sh << 'EOF'
@@ -382,5 +428,5 @@ jobs:
       - name: Upload Installable Android APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: VSCode-Android-Standalone-arm64-v8a-APK
+          name: Pocket-VS-Code-arm64-v8a-APK
           path: app/build/outputs/apk/debug/app-debug.apk
