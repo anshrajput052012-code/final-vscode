@@ -135,35 +135,51 @@ jobs:
           EOF
           curl -fSL -H "User-Agent: Mozilla/5.0" "https://update.code.visualstudio.com/latest/linux-arm64/stable" -o app/src/main/assets/vscode-linux-arm64.tar.gz
 
-      - name: Patch In-App Launch Script & Lock WebView Inside App
+      - name: Fix Mode 1 (Non-Root User UI) & Mode 2 (serve-web & In-App WebView)
         run: |
           python3 - << 'EOF'
           import os, re
 
-          # 1. Patch original start-vscode-session.sh so Mode 1 (noVNC + Xtigervnc) and Mode 2 both work inside the app
           script_path = "app/src/main/assets/start-vscode-session.sh"
-          if os.path.exists(script_path):
-              with open(script_path, "r", encoding="utf-8") as f:
-                  s = f.read()
-          else:
-              s = ""
+          with open(script_path, "r", encoding="utf-8") as f:
+              orig = f.read()
 
-          print("=== Original start-vscode-session.sh ===")
-          print(s)
+          # Remove any broken flags from original script
+          orig = orig.replace("--I-KNOW-THIS-IS-INSECURE", "")
+          orig = re.sub(r'1280x720|1280x800|1024x768', '1920x1080', orig)
+          orig = re.sub(r'--extensions-dir\s+\S+', '', orig)
+          orig = re.sub(r'(serve-web[\s\S]*?)--user-data-dir', r'\1--server-data-dir', orig)
 
-          # Clean up broken flags and upgrade resolution & stability
-          s = s.replace("--I-KNOW-THIS-IS-INSECURE", "")
-          s = re.sub(r'1280x720|1280x800|1024x768', '1920x1080', s)
-          s = re.sub(r'(serve-web[\s\S]*?)--user-data-dir', r'\1--server-data-dir', s)
+          if "/opt/vscode-arm64/code" in orig and "--disable-gpu" not in orig:
+              orig = orig.replace("/opt/vscode-arm64/code", "/opt/vscode-arm64/code --no-sandbox --disable-gpu --disable-dev-shm-usage --disable-software-rasterizer")
 
-          # Ensure Electron runs with --no-sandbox --disable-gpu --disable-dev-shm-usage in PRoot X11
-          if "/opt/vscode-arm64/code" in s and "--disable-gpu" not in s:
-              s = s.replace("/opt/vscode-arm64/code", "/opt/vscode-arm64/code --no-sandbox --disable-gpu --disable-dev-shm-usage --disable-software-rasterizer")
-
-          # Inject port & lock cleanup right after shebang so ports 5901/6080/8080 are never busy
-          cleanup_block = """#!/bin/bash
-          mkdir -p /tmp /dev/shm /root/.config/Code /root/.vscode-server-data /root/Workspace
+          header_patch = """#!/bin/bash
+          mkdir -p /tmp /dev/shm /root/.config/Code /root/.vscode-server-data /root/Workspace /usr/local/bin
           chmod 1777 /tmp /dev/shm || true
+
+          # 1. Provide sudo wrapper so user commands work like a standard Linux user
+          if [ ! -f /usr/local/bin/sudo ]; then
+              printf '#!/bin/sh\\nexec "$@"\\n' > /usr/local/bin/sudo
+              chmod 755 /usr/local/bin/sudo
+          fi
+
+          # 2. Silence /proc/version permission warning in VS Code launcher scripts
+          if [ -f /opt/vscode-arm64/bin/code ]; then
+              sed -i 's|/proc/version|/dev/null|g' /opt/vscode-arm64/bin/code || true
+          fi
+
+          # 3. Patch VS Code Workbench & Preload so it runs as normal user (UID 1000) without [Superuser] or root warning
+          if [ ! -f /opt/vscode-arm64/.noroot_patched ] && [ -d /opt/vscode-arm64/resources/app/out ]; then
+              echo "[start-vscode] Configuring VS Code non-root user profile..."
+              find /opt/vscode-arm64/resources/app/out -name "preload*.js" -exec sed -i 's/process\.getuid()/1000/g' {} + || true
+              WB_JS="/opt/vscode-arm64/resources/app/out/vs/workbench/workbench.desktop.main.js"
+              if [ -f "$WB_JS" ]; then
+                  sed -i 's/\.getuid\?\.()===0/false/g; s/\.getuid()===0/false/g; s/ \[Superuser\]//g; s/\[Superuser\]//g' "$WB_JS" || true
+              fi
+              touch /opt/vscode-arm64/.noroot_patched
+          fi
+
+          # 4. Clean up stale processes and locks before starting session
           pkill -9 -f "code serve-web" || true
           pkill -9 -f "code-tunnel" || true
           pkill -9 -f Xtigervnc || true
@@ -171,17 +187,30 @@ jobs:
           pkill -9 -f openbox || true
           rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1 /tmp/.X*-lock /tmp/.X11-unix/X*
           sleep 1
+
+          # 5. If Mode 2 (direct) is selected, launch clean serve-web without invalid flags
+          if [ "$1" = "direct" ]; then
+              echo "[start-vscode] Starting Official VS Code Native Workbench Host (code serve-web)..."
+              export USER=coder
+              exec /opt/vscode-arm64/bin/code serve-web \\
+                  --host 127.0.0.1 \\
+                  --port 8080 \\
+                  --without-connection-token \\
+                  --accept-server-license-terms \\
+                  --server-data-dir /root/.vscode-server-data
+          fi
           """
-          if s.startswith("#!/"):
-              s = re.sub(r'^#!/[^\n]*\n', cleanup_block + "\n", s, count=1)
+
+          if orig.startswith("#!/"):
+              orig = re.sub(r'^#!/[^\n]*\n', header_patch + "\n", orig, count=1)
           else:
-              s = cleanup_block + "\n" + s
+              orig = header_patch + "\n" + orig
 
           with open(script_path, "w", encoding="utf-8") as f:
-              f.write(s)
+              f.write(orig)
           os.chmod(script_path, 0o755)
 
-          # 2. Ensure ProotProcessManager ALWAYS copies latest asset scripts before running any command
+          # Patch ProotProcessManager & WorkbenchActivity so scripts auto-update and Mode 2 stays inside WebView
           for root, _, files in os.walk("app/src/main/java"):
               for fn in files:
                   p = os.path.join(root, fn)
@@ -207,23 +236,21 @@ jobs:
                           )
                           with open(p, "w", encoding="utf-8") as f:
                               f.write(code)
-                          print("Patched ProotProcessManager to auto-sync scripts on every launch.")
 
-                  # 3. Ensure MainActivity never opens an external browser (Intent.ACTION_VIEW)
-                  if fn == "MainActivity.kt":
-                      with open(p, "r", encoding="utf-8") as f:
-                          code = f.read()
-                      if "ACTION_VIEW" in code:
-                          print("Found ACTION_VIEW in MainActivity, keeping all launches inside WorkbenchActivity.")
-
-                  # 4. Lock WorkbenchActivity WebView so URLs/redirects NEVER open Chrome/Website
                   if fn == "WorkbenchActivity.kt":
                       with open(p, "r", encoding="utf-8") as f:
                           code = f.read()
-                      print("=== Inspecting WorkbenchActivity.kt ===")
-                      print(code)
-                      # Replace any external browser intent inside WebViewClient with in-app loading
+                      # Force all WebView navigation and redirects to stay inside the app
                       code = re.sub(r'startActivity\s*\([^)]*ACTION_VIEW[^)]*\)', '', code)
+                      if "shouldOverrideUrlLoading" not in code and "webView.settings" in code:
+                          wv_client = """
+                          webView.webViewClient = object : android.webkit.WebViewClient() {
+                              override fun shouldOverrideUrlLoading(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): Boolean = false
+                              @Deprecated("Deprecated in Java")
+                              override fun shouldOverrideUrlLoading(view: android.webkit.WebView?, url: String?): Boolean = false
+                          }
+                          """
+                          code = code.replace("webView.settings.javaScriptEnabled = true", "webView.settings.javaScriptEnabled = true\n" + wv_client)
                       with open(p, "w", encoding="utf-8") as f:
                           f.write(code)
           EOF
@@ -406,7 +433,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           RELEASE_TAG="v1.0.${{ github.run_number }}"
-          gh release create "$RELEASE_TAG" PocketVSCode-arm64.apk --target "${{ github.sha }}" --title "Pocket VS Code ($RELEASE_TAG)" --notes "Opens 100% inside the app window (Mode 1 Desktop X11 + Mode 2 In-App)."
+          gh release create "$RELEASE_TAG" PocketVSCode-arm64.apk --target "${{ github.sha }}" --title "Pocket VS Code ($RELEASE_TAG)" --notes "Fixed Mode 2 (--extensions-dir removed) and Mode 1 non-root user profile."
 
       - name: Upload Artifact Backup
         if: always()
