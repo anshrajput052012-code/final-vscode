@@ -404,3 +404,13 @@ jobs:
       - name: Publish Direct APK to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RELEASE_TAG="v1.0.${{ github.run_number }}"
+          gh release create "$RELEASE_TAG" PocketVSCode-arm64.apk --target "${{ github.sha }}" --title "Pocket VS Code ($RELEASE_TAG)" --notes "Opens 100% inside the app window (Mode 1 Desktop X11 + Mode 2 In-App)."
+
+      - name: Upload Artifact Backup
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pocket-VS-Code-arm64-v8a-APK
+          path: PocketVSCode-arm64.apk
