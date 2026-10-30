@@ -232,7 +232,7 @@ jobs:
           EOF
           curl -fSL -H "User-Agent: Mozilla/5.0" "https://update.code.visualstudio.com/latest/linux-arm64/stable" -o app/src/main/assets/vscode-linux-arm64.tar.gz
 
-      - name: Fix Mode 2 Auto-Resume, Inbuilt Browser Lock, & Mode 1 Non-Root UI
+      - name: Add Auto-Save, Session Persistence, & Battery Optimization
         run: |
           python3 - << 'EOF'
           import os, re
@@ -241,7 +241,6 @@ jobs:
           with open(script_path, "r", encoding="utf-8") as f:
               orig = f.read()
 
-          # Clean invalid CLI flags from original script
           orig = orig.replace("--I-KNOW-THIS-IS-INSECURE", "")
           orig = re.sub(r'1280x720|1280x800|1024x768', '1920x1080', orig)
           orig = re.sub(r'--extensions-dir\s+\S+\s*(\\?\n)?', '', orig)
@@ -250,11 +249,10 @@ jobs:
           if "/opt/vscode-arm64/code" in orig and "--disable-gpu" not in orig:
               orig = orig.replace("/opt/vscode-arm64/code", "/opt/vscode-arm64/code --no-sandbox --disable-gpu --disable-dev-shm-usage --disable-software-rasterizer")
 
-          # Replace direct serve-web call with smart-resume wrapper so Mode 2 never throws os error 98 and always resumes session
           orig = orig.replace("/opt/vscode-arm64/bin/code serve-web", "/usr/local/bin/code-serve-web-smart")
 
           header_patch = """#!/bin/bash
-          mkdir -p /tmp /dev/shm /root/.config/Code /root/.vscode-server-data /root/Workspace /usr/local/bin
+          mkdir -p /tmp /dev/shm /root/.config/Code/User /root/.vscode-server-data/data/Machine /root/.vscode-server-data/data/User /root/Workspace /usr/local/bin
           chmod 1777 /tmp /dev/shm || true
 
           if [ ! -f /usr/local/bin/sudo ]; then
@@ -266,18 +264,68 @@ jobs:
               sed -i 's|/proc/version|/dev/null|g' /opt/vscode-arm64/bin/code || true
           fi
 
-          # Create Smart Resume Wrapper for Mode 2 (code serve-web)
+          # 1. Configure Auto-Save (500ms), Hot-Exit Session Restore, and Battery-Saving Watcher Exclusions
+          for S_PATH in "/root/.config/Code/User/settings.json" "/root/.vscode-server-data/data/Machine/settings.json" "/root/.vscode-server-data/data/User/settings.json"; do
+              if [ ! -f "$S_PATH" ]; then
+                  cat > "$S_PATH" << 'JSONEOF'
+          {
+              "files.autoSave": "afterDelay",
+              "files.autoSaveDelay": 500,
+              "files.hotExit": "onExitAndWindowClose",
+              "window.restoreWindows": "all",
+              "workbench.startupEditor": "none",
+              "telemetry.telemetryLevel": "off",
+              "extensions.autoCheckUpdates": false,
+              "extensions.autoUpdate": false,
+              "update.mode": "none",
+              "files.watcherExclude": {
+                  "**/.git/objects/**": true,
+                  "**/.git/subtree-cache/**": true,
+                  "**/node_modules/*/**": true,
+                  "**/.hg/store/**": true,
+                  "**/build/**": true,
+                  "**/.gradle/**": true
+              }
+          }
+          JSONEOF
+              fi
+          done
+
+          # 2. Smart Mode 2 Wrapper with Battery-Saving Idle Auto-Hibernation (stops after 10 mins of no browser connection)
           cat > /usr/local/bin/code-serve-web-smart << 'WRAPEOF'
           #!/bin/bash
+          start_idle_watcher() {
+              (
+                  IDLE_SECONDS=0
+                  while pgrep -f "serve-web" >/dev/null 2>&1; do
+                      sleep 30
+                      # Check /proc/net/tcp for ESTABLished (01) connections on port 8080 (hex 1F90)
+                      if grep -q ":1F90 .* 01 " /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+                          IDLE_SECONDS=0
+                      else
+                          IDLE_SECONDS=$((IDLE_SECONDS + 30))
+                      fi
+                      # Hibernate server after 600s (10 mins) of closed website to save 100% background battery
+                      if [ "$IDLE_SECONDS" -ge 600 ]; then
+                          echo "[battery-saver] Mode 2 website closed for 10 mins. Auto-saving and hibernating server..."
+                          pkill -15 -f "serve-web" || true
+                          exit 0
+                      fi
+                  done
+              ) &
+          }
+
           if pgrep -f "code-tunnel.*serve-web" >/dev/null 2>&1 || pgrep -f "opt/vscode-arm64.*serve-web" >/dev/null 2>&1; then
-              echo "[start-vscode] Resuming existing active Mode 2 session on port 8080..."
+              echo "[start-vscode] Resuming active Mode 2 session on port 8080..."
               echo "Web UI available at http://127.0.0.1:8080/?folder=/root/Workspace"
               while pgrep -f "serve-web" >/dev/null 2>&1; do
-                  sleep 2
+                  sleep 3
               done
               exit 0
           fi
-          exec /opt/vscode-arm64/bin/code serve-web \\
+
+          start_idle_watcher
+          exec nice -n 5 /opt/vscode-arm64/bin/code serve-web \\
               --host 127.0.0.1 \\
               --port 8080 \\
               --without-connection-token \\
@@ -313,7 +361,6 @@ jobs:
               f.write(orig)
           os.chmod(script_path, 0o755)
 
-          # Patch Kotlin files so scripts auto-sync, Mode 2 opens inbuilt WorkbenchActivity, and WebView keeps all redirects inside the app
           for root, _, files in os.walk("app/src/main/java"):
               for fn in files:
                   p = os.path.join(root, fn)
@@ -344,11 +391,9 @@ jobs:
                       with open(p, "r", encoding="utf-8") as f:
                           code = f.read()
 
-                      # Open default /root/Workspace folder in Mode 2 so user lands right in their project
                       code = code.replace('"http://127.0.0.1:8080"', '"http://127.0.0.1:8080/?folder=/root/Workspace"')
                       code = code.replace('"http://127.0.0.1:8080/"', '"http://127.0.0.1:8080/?folder=/root/Workspace"')
 
-                      # Lock WebView right before any .loadUrl( call so it never opens Chrome and auto-retries while server boots
                       if ".loadUrl(" in code and "shouldOverrideUrlLoading" not in code:
                           wv_chain = """.apply {
                               settings.javaScriptEnabled = true
@@ -366,6 +411,26 @@ jobs:
                               }
                           }.loadUrl("""
                           code = code.replace(".loadUrl(", wv_chain)
+
+                      # Add WebView lifecycle battery saver + auto-blur flush when user leaves WorkbenchActivity
+                      if fn == "WorkbenchActivity.kt" and "override fun onPause()" not in code:
+                          lifecycle_patch = """
+                          override fun onPause() {
+                              try {
+                                  webView.evaluateJavascript("window.dispatchEvent(new Event('blur')); document.dispatchEvent(new Event('visibilitychange'));", null)
+                                  webView.onPause()
+                              } catch (_: Exception) {}
+                              super.onPause()
+                          }
+
+                          override fun onResume() {
+                              super.onResume()
+                              try {
+                                  webView.onResume()
+                              } catch (_: Exception) {}
+                          }
+                          """
+                          code = re.sub(r'(\}\s*)$', lifecycle_patch + "\n}", code, count=1)
 
                       with open(p, "w", encoding="utf-8") as f:
                           f.write(code)
@@ -552,7 +617,7 @@ jobs:
           gh release create "$RELEASE_TAG" PocketVSCode-arm64.apk pocket-vscode-permanent.keystore \
             --target "${{ github.sha }}" \
             --title "Pocket VS Code ($RELEASE_TAG)" \
-            --notes "Added official VS Code icon, Mode 2 session auto-resume, and inbuilt WebView lock."
+            --notes "Added Mode 2 Auto-Save, Session State Persistence, and Idle Battery Hibernation."
 
       - name: Upload Artifact Backup
         if: always()
