@@ -109,43 +109,16 @@ jobs:
 
           cat > app/src/main/res/values/colors.xml << 'EOF'
           <resources>
-              <color name="ic_launcher_background">#181818</color>
+              <color name="ic_launcher_background">#1E1E1E</color>
           </resources>
           EOF
 
           rm -rf app/src/main/res/mipmap-anydpi*
           rm -rf app/src/main/res/drawable*/ic_launcher*
 
-          # Download high-res Fluent Ribbon icon with browser User-Agent
-          python3 - << 'EOF'
-          import urllib.request, sys
-
-          urls = [
-              "https://upload.wikimedia.org/wikipedia/commons/thumb/9/9a/Visual_Studio_Code_1.35_icon.svg/1024px-Visual_Studio_Code_1.35_icon.svg.png",
-              "https://raw.githubusercontent.com/microsoft/vscode/main/resources/linux/code.png"
-          ]
-
-          success = False
-          headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-
-          for url in urls:
-              try:
-                  req = urllib.request.Request(url, headers=headers)
-                  with urllib.request.urlopen(req, timeout=30) as resp:
-                      if resp.status == 200:
-                          data = resp.read()
-                          if len(data) > 5000 and data[:8] == b'\x89PNG\r\n\x1a\n':
-                              with open("vscode_ribbon.png", "wb") as f:
-                                  f.write(data)
-                              print(f"Successfully downloaded icon from {url}")
-                              success = True
-                              break
-              except Exception as e:
-                  print(f"Failed {url}: {e}")
-
-          if not success:
-              sys.exit("Failed to download valid PNG icon")
-          EOF
+          # Download high-res official Microsoft Fluent Blue Ribbon icon reliably from CDN
+          curl -fSL "https://cdn.jsdelivr.net/gh/microsoft/vscode/resources/linux/code.png" -o vscode_ribbon.png || \
+          curl -fSL "https://raw.githubusercontent.com/microsoft/vscode/main/resources/linux/code.png" -o vscode_ribbon.png
 
           python3 - << 'EOF'
           import os, re
@@ -178,16 +151,14 @@ jobs:
               dest_dir = os.path.join("app/src/main/res", folder)
               os.makedirs(dest_dir, exist_ok=True)
 
-              bg = Image.new("RGBA", (legacy_size, legacy_size), (24, 24, 24, 255))
-              inner_legacy = int(legacy_size * 0.82)
-              resized_legacy = img.resize((inner_legacy, inner_legacy), Image.Resampling.LANCZOS)
-              offset_l = (legacy_size - inner_legacy) // 2
-              bg.paste(resized_legacy, (offset_l, offset_l), resized_legacy)
-              bg.save(os.path.join(dest_dir, "ic_launcher.png"))
-              bg.save(os.path.join(dest_dir, "ic_launcher_round.png"))
+              # Clean transparent legacy icon (Direct ribbon without black box)
+              legacy_icon = img.resize((legacy_size, legacy_size), Image.Resampling.LANCZOS)
+              legacy_icon.save(os.path.join(dest_dir, "ic_launcher.png"))
+              legacy_icon.save(os.path.join(dest_dir, "ic_launcher_round.png"))
 
+              # Adaptive foreground with safe-zone margin
               fg = Image.new("RGBA", (adaptive_size, adaptive_size), (0, 0, 0, 0))
-              inner_adapt = int(adaptive_size * 0.65)
+              inner_adapt = int(adaptive_size * 0.72)
               resized_adapt = img.resize((inner_adapt, inner_adapt), Image.Resampling.LANCZOS)
               offset_a = (adaptive_size - inner_adapt) // 2
               fg.paste(resized_adapt, (offset_a, offset_a), resized_adapt)
@@ -211,7 +182,7 @@ jobs:
                       with open(mpath, "w", encoding="utf-8") as f:
                           f.write(c)
 
-          print("Generated Fluent Ribbon Icons successfully.")
+          print("Generated clean Fluent Ribbon Icons successfully.")
           EOF
 
       - name: Pre-Bundle Debian Rootfs and Official VS Code
@@ -627,7 +598,7 @@ jobs:
           gh release create "$RELEASE_TAG" PocketVSCode-arm64.apk \
             --target "${{ github.sha }}" \
             --title "Pocket VS Code ($RELEASE_TAG)" \
-            --notes "Zero-click direct auto-launch with exact Fluent ribbon VS Code icon."
+            --notes "Zero-click direct auto-launch with clean Fluent ribbon VS Code icon."
 
       - name: Upload Artifact Backup
         if: always()
