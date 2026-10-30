@@ -116,11 +116,36 @@ jobs:
           rm -rf app/src/main/res/mipmap-anydpi*
           rm -rf app/src/main/res/drawable*/ic_launcher*
 
-          # Fetch official 1024px High-Res Modern Fluent Blue Ribbon Logo
-          curl -sL "https://upload.wikimedia.org/wikipedia/commons/thumb/9/9a/Visual_Studio_Code_1.35_icon.svg/1024px-Visual_Studio_Code_1.35_icon.svg.png" -o vscode_ribbon.png
-          if [ ! -s vscode_ribbon.png ]; then
-              curl -sL "https://raw.githubusercontent.com/microsoft/vscode/main/resources/linux/code.png" -o vscode_ribbon.png
-          fi
+          # Download high-res Fluent Ribbon icon with browser User-Agent
+          python3 - << 'EOF'
+          import urllib.request, sys
+
+          urls = [
+              "https://upload.wikimedia.org/wikipedia/commons/thumb/9/9a/Visual_Studio_Code_1.35_icon.svg/1024px-Visual_Studio_Code_1.35_icon.svg.png",
+              "https://raw.githubusercontent.com/microsoft/vscode/main/resources/linux/code.png"
+          ]
+
+          success = False
+          headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+
+          for url in urls:
+              try:
+                  req = urllib.request.Request(url, headers=headers)
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      if resp.status == 200:
+                          data = resp.read()
+                          if len(data) > 5000 and data[:8] == b'\x89PNG\r\n\x1a\n':
+                              with open("vscode_ribbon.png", "wb") as f:
+                                  f.write(data)
+                              print(f"Successfully downloaded icon from {url}")
+                              success = True
+                              break
+              except Exception as e:
+                  print(f"Failed {url}: {e}")
+
+          if not success:
+              sys.exit("Failed to download valid PNG icon")
+          EOF
 
           python3 - << 'EOF'
           import os, re
@@ -153,7 +178,6 @@ jobs:
               dest_dir = os.path.join("app/src/main/res", folder)
               os.makedirs(dest_dir, exist_ok=True)
 
-              # Legacy standalone icon with dark round background
               bg = Image.new("RGBA", (legacy_size, legacy_size), (24, 24, 24, 255))
               inner_legacy = int(legacy_size * 0.82)
               resized_legacy = img.resize((inner_legacy, inner_legacy), Image.Resampling.LANCZOS)
@@ -162,7 +186,6 @@ jobs:
               bg.save(os.path.join(dest_dir, "ic_launcher.png"))
               bg.save(os.path.join(dest_dir, "ic_launcher_round.png"))
 
-              # Adaptive foreground with standard safe-zone margin
               fg = Image.new("RGBA", (adaptive_size, adaptive_size), (0, 0, 0, 0))
               inner_adapt = int(adaptive_size * 0.65)
               resized_adapt = img.resize((inner_adapt, inner_adapt), Image.Resampling.LANCZOS)
@@ -188,7 +211,7 @@ jobs:
                       with open(mpath, "w", encoding="utf-8") as f:
                           f.write(c)
 
-          print("Generated exact Fluent Ribbon Icon across all resolutions.")
+          print("Generated Fluent Ribbon Icons successfully.")
           EOF
 
       - name: Pre-Bundle Debian Rootfs and Official VS Code
@@ -324,7 +347,6 @@ jobs:
               f.write(orig)
           os.chmod(script_path, 0o755)
 
-          # Auto-sync launch scripts in ProotProcessManager
           for root, _, files in os.walk("app/src/main/java"):
               for fn in files:
                   p = os.path.join(root, fn)
@@ -392,9 +414,7 @@ jobs:
                       with open(p, "r", encoding="utf-8") as f:
                           code = f.read()
 
-                      # Auto-launch trigger right after onCreate UI finishes
                       auto_launch_block = """
-                              // Auto-Launch Genuine VS Code directly on start
                               val isBashReady = java.io.File(prootManager.rootfsDir, "bin/bash").exists()
                               val isCodeReady = java.io.File(prootManager.rootfsDir, "opt/vscode-arm64/bin/code").exists()
 
@@ -408,7 +428,6 @@ jobs:
                       """
 
                       if "Auto-launching Workbench" not in code:
-                          # Inject after onCreate ends
                           code = re.sub(
                               r'(override\s+fun\s+onCreate[^{]+\{[\s\S]*?)(setContentView\([^)]+\))',
                               r'\1\2\n' + auto_launch_block,
@@ -416,7 +435,6 @@ jobs:
                               count=1
                           )
 
-                      # Chain launch automatically when provisioning finishes on first run
                       if "performClick()" in code and "Provisioning finished with code 0" not in code:
                           code = code.replace(
                               'if (success) {',
@@ -609,7 +627,7 @@ jobs:
           gh release create "$RELEASE_TAG" PocketVSCode-arm64.apk \
             --target "${{ github.sha }}" \
             --title "Pocket VS Code ($RELEASE_TAG)" \
-            --notes "Zero-click direct auto-launch with official Fluent ribbon VS Code icon."
+            --notes "Zero-click direct auto-launch with exact Fluent ribbon VS Code icon."
 
       - name: Upload Artifact Backup
         if: always()
