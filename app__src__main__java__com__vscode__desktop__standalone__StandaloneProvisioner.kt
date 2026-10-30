@@ -12,6 +12,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.file.Files
 import java.nio.file.Paths
+import java.io.IoException
 
 /**
  * Downloads and unpacks the ARM64 Debian glibc rootfs and the genuine Microsoft VS Code
@@ -124,50 +125,171 @@ class StandaloneProvisioner(
         }
     }
 
-    private fun extractTarArchive(
-        archiveFile: File,
-        destDir: File,
-        isXz: Boolean,
-        stripComponents: Int
-    ) {
-        FileInputStream(archiveFile).use { fis ->
-            BufferedInputStream(fis).use { bis ->
-                val compressorStream = if (isXz) {
-                    XZCompressorInputStream(bis)
-                } else {
-                    GzipCompressorInputStream(bis)
-                }
-                TarArchiveInputStream(compressorStream).use { tarIn ->
-                    var entry = tarIn.nextTarEntry
-                    while (entry != null) {
-                        val parts = entry.name.split("/").filter { it.isNotEmpty() }
-                        if (parts.size > stripComponents) {
-                            val relPath = parts.drop(stripComponents).joinToString("/")
-                            val outFile = File(destDir, relPath)
+    
+}
+
+private fun extractTarArchive(
+    archiveFile: File,
+    destDir: File,
+    isXz: Boolean,
+    stripComponents: Int
+) {
+    if (stripComponents < 0) {
+        throw IOException("Invalid stripComponents")
+    }
+
+    if (!destDir.exists() && !destDir.mkdirs()) {
+        throw IOException("Cannot create destination directory")
+    }
+
+    val root = destDir.canonicalFile.toPath().normalize()
+
+    // Validate that a path stays inside the extraction root.
+    fun checkedPath(path: Path): Path {
+        val normalized = path.toAbsolutePath().normalize()
+
+        if (!normalized.startsWith(root)) {
+            throw IOException("Unsafe archive path: $path")
+        }
+
+        val canonical = normalized.toFile().canonicalFile.toPath()
+
+        if (!canonical.startsWith(root)) {
+            throw IOException("Path escapes extraction directory: $path")
+        }
+
+        return normalized
+    }
+
+    // Create parent directories without allowing escape through symlinks.
+    fun createSafeParents(parent: Path) {
+        val safeParent = checkedPath(parent)
+        val parentFile = safeParent.toFile()
+
+        if (!parentFile.exists() && !parentFile.mkdirs()) {
+            throw IOException("Cannot create directory: $parent")
+        }
+
+        checkedPath(safeParent)
+    }
+
+    FileInputStream(archiveFile).use { fis ->
+        BufferedInputStream(fis).use { bis ->
+
+            val compressorStream = if (isXz) {
+                XZCompressorInputStream(bis)
+            } else {
+                GzipCompressorInputStream(bis)
+            }
+
+            TarArchiveInputStream(compressorStream).use { tarIn ->
+
+                var entry = tarIn.nextTarEntry
+
+                while (entry != null) {
+
+                    val name = entry.name
+
+                    // Reject absolute paths and parent traversal.
+                    if (name.startsWith("/")) {
+                        throw IOException("Absolute archive path rejected: $name")
+                    }
+
+                    val parts = name.split("/")
+                        .filter { it.isNotEmpty() }
+
+                    if (parts.any { it == ".." }) {
+                        throw IOException("Path traversal rejected: $name")
+                    }
+
+                    if (parts.size > stripComponents) {
+
+                        val relPath = parts
+                            .drop(stripComponents)
+                            .joinToString("/")
+
+                        if (relPath.isNotEmpty()) {
+
+                            val outPath = checkedPath(
+                                root.resolve(relPath)
+                            )
+
+                            val outFile = outPath.toFile()
+
                             if (entry.isDirectory) {
-                                outFile.mkdirs()
-                            } else if (entry.isSymbolicLink) {
-                                outFile.parentFile?.mkdirs()
-                                outFile.delete()
-                                try {
-                                    Files.createSymbolicLink(
-                                        outFile.toPath(),
-                                        Paths.get(entry.linkName)
+
+                                if (!outFile.exists() && !outFile.mkdirs()) {
+                                    throw IOException(
+                                        "Cannot create directory: $relPath"
                                     )
-                                } catch (_: Exception) {
                                 }
+
+                                checkedPath(outPath)
+
+                            } else if (entry.isSymbolicLink) {
+
+                                val parent = outPath.parent
+                                    ?: throw IOException("Invalid symlink path")
+
+                                createSafeParents(parent)
+
+                                val linkName = entry.linkName
+                                val linkTarget = java.nio.file.Paths.get(linkName)
+
+                                // Absolute Linux paths are mapped inside rootfs.
+                                val targetPath = if (linkTarget.isAbsolute) {
+                                    root.resolve(
+                                        linkName.removePrefix("/")
+                                    ).normalize()
+                                } else {
+                                    parent.resolve(linkTarget).normalize()
+                                }
+
+                                if (!targetPath.startsWith(root)) {
+                                    throw IOException(
+                                        "Unsafe symlink target: $linkName"
+                                    )
+                                }
+
+                                val safeTarget = checkedPath(targetPath)
+
+                                java.nio.file.Files.deleteIfExists(outPath)
+
+                                val relativeTarget = parent.relativize(safeTarget)
+
+                                java.nio.file.Files.createSymbolicLink(
+                                    outPath,
+                                    relativeTarget
+                                )
+
+                            } else if (entry.isLink) {
+
+                                throw IOException(
+                                    "Hard links are not supported: $name"
+                                )
+
                             } else {
-                                outFile.parentFile?.mkdirs()
-                                FileOutputStream(outFile).use { out ->
+
+                                val parent = outPath.parent
+                                    ?: throw IOException("Invalid file path")
+
+                                createSafeParents(parent)
+
+                                // Never follow an existing destination symlink.
+                                java.nio.file.Files.deleteIfExists(outPath)
+
+                                FileOutputStream(outPath.toFile()).use { out ->
                                     tarIn.copyTo(out)
                                 }
+
                                 if ((entry.mode and 0b001_000_000) != 0) {
                                     outFile.setExecutable(true, false)
                                 }
                             }
                         }
-                        entry = tarIn.nextTarEntry
                     }
+
+                    entry = tarIn.nextTarEntry
                 }
             }
         }
