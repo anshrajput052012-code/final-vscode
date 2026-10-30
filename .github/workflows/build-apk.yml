@@ -73,19 +73,14 @@ jobs:
           mkdir -p ~/.android app /tmp/keystore_dl
           RESTORED=false
 
-          # 1. Try restoring from repo if exists
           if [ -f "app/keystore.jks" ]; then
-            echo "Keystore found in repository."
             cp app/keystore.jks ~/.android/debug.keystore
             RESTORED=true
           fi
 
-          # 2. Try downloading permanent keystore from previous releases
           if [ "$RESTORED" = "false" ]; then
-            echo "Searching previous GitHub releases for permanent keystore..."
             if gh release download --pattern "pocket-vscode-permanent.keystore" --dir /tmp/keystore_dl 2>/dev/null; then
               if [ -f "/tmp/keystore_dl/pocket-vscode-permanent.keystore" ]; then
-                echo "Successfully restored permanent keystore from GitHub Release."
                 cp /tmp/keystore_dl/pocket-vscode-permanent.keystore ~/.android/debug.keystore
                 cp /tmp/keystore_dl/pocket-vscode-permanent.keystore app/keystore.jks
                 RESTORED=true
@@ -93,9 +88,7 @@ jobs:
             fi
           fi
 
-          # 3. If first run, generate the permanent key once
           if [ "$RESTORED" = "false" ]; then
-            echo "Creating initial permanent keystore..."
             keytool -genkeypair -v \
               -keystore ~/.android/debug.keystore \
               -alias androiddebugkey \
@@ -110,7 +103,6 @@ jobs:
 
           cp ~/.android/debug.keystore pocket-vscode-permanent.keystore
 
-          # Force add keystore to bypass .gitignore rules
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -f app/keystore.jks || true
@@ -120,15 +112,84 @@ jobs:
           find app -name "build.gradle.kts" -exec sed -i 's/versionCode = [0-9]*/versionCode = ${{ github.run_number }}/g' {} + || true
           find app -name "build.gradle" -exec sed -i 's/versionCode [0-9]*/versionCode ${{ github.run_number }}/g' {} + || true
 
-      - name: Set App Name
+      - name: Set App Name and Generate Official VS Code Icons
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y python3-pil curl
+
           mkdir -p app/src/main/res/values
           cat > app/src/main/res/values/strings.xml << 'EOF'
           <resources>
               <string name="app_name">Pocket VS Code</string>
+              <color name="ic_launcher_background">#1E1E1E</color>
           </resources>
           EOF
-          find app/src/main -name "AndroidManifest.xml" -exec sed -i 's/android:label="[^"]*"/android:label="@string\/app_name"/g' {} + || true
+
+          rm -rf app/src/main/res/mipmap-anydpi*
+          rm -rf app/src/main/res/drawable*/ic_launcher*
+
+          curl -sL "https://raw.githubusercontent.com/microsoft/vscode/main/resources/linux/code.png" -o vscode_icon.png
+
+          python3 - << 'EOF'
+          import os, re
+          from PIL import Image
+
+          img = Image.open("vscode_icon.png").convert("RGBA")
+
+          v26_dir = "app/src/main/res/mipmap-anydpi-v26"
+          os.makedirs(v26_dir, exist_ok=True)
+          adaptive_xml = '''<?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background" />
+              <foreground android:drawable="@mipmap/ic_launcher_foreground" />
+          </adaptive-icon>
+          '''
+          with open(os.path.join(v26_dir, "ic_launcher.xml"), "w") as f:
+              f.write(adaptive_xml)
+          with open(os.path.join(v26_dir, "ic_launcher_round.xml"), "w") as f:
+              f.write(adaptive_xml)
+
+          densities = {
+              "mipmap-mdpi": (48, 108),
+              "mipmap-hdpi": (72, 162),
+              "mipmap-xhdpi": (96, 216),
+              "mipmap-xxhdpi": (144, 324),
+              "mipmap-xxxhdpi": (192, 432)
+          }
+
+          for folder, (legacy_size, adaptive_size) in densities.items():
+              dest_dir = os.path.join("app/src/main/res", folder)
+              os.makedirs(dest_dir, exist_ok=True)
+
+              legacy_icon = img.resize((legacy_size, legacy_size), Image.Resampling.LANCZOS)
+              legacy_icon.save(os.path.join(dest_dir, "ic_launcher.png"))
+              legacy_icon.save(os.path.join(dest_dir, "ic_launcher_round.png"))
+
+              fg = Image.new("RGBA", (adaptive_size, adaptive_size), (0, 0, 0, 0))
+              inner_size = int(adaptive_size * 0.66)
+              inner_img = img.resize((inner_size, inner_size), Image.Resampling.LANCZOS)
+              offset = (adaptive_size - inner_size) // 2
+              fg.paste(inner_img, (offset, offset), inner_img)
+              fg.save(os.path.join(dest_dir, "ic_launcher_foreground.png"))
+
+          for root, _, files in os.walk("app/src/main"):
+              for file in files:
+                  if file == "AndroidManifest.xml":
+                      mpath = os.path.join(root, file)
+                      with open(mpath, "r", encoding="utf-8") as f:
+                          c = f.read()
+                      if 'android:icon=' in c:
+                          c = re.sub(r'android:icon="[^"]*"', 'android:icon="@mipmap/ic_launcher"', c)
+                      else:
+                          c = re.sub(r'<application', '<application android:icon="@mipmap/ic_launcher"', c, count=1)
+                      if 'android:roundIcon=' in c:
+                          c = re.sub(r'android:roundIcon="[^"]*"', 'android:roundIcon="@mipmap/ic_launcher_round"', c)
+                      else:
+                          c = re.sub(r'<application', '<application android:roundIcon="@mipmap/ic_launcher_round"', c, count=1)
+                      c = re.sub(r'android:label="[^"]*"', 'android:label="@string/app_name"', c)
+                      with open(mpath, "w", encoding="utf-8") as f:
+                          f.write(c)
+          EOF
 
       - name: Pre-Bundle Debian Rootfs and Official VS Code
         env:
@@ -171,7 +232,7 @@ jobs:
           EOF
           curl -fSL -H "User-Agent: Mozilla/5.0" "https://update.code.visualstudio.com/latest/linux-arm64/stable" -o app/src/main/assets/vscode-linux-arm64.tar.gz
 
-      - name: Fix Mode 1 (Non-Root User UI) & Mode 2 (serve-web & In-App WebView)
+      - name: Fix Mode 2 Auto-Resume, Inbuilt Browser Lock, & Mode 1 Non-Root UI
         run: |
           python3 - << 'EOF'
           import os, re
@@ -180,13 +241,17 @@ jobs:
           with open(script_path, "r", encoding="utf-8") as f:
               orig = f.read()
 
+          # Clean invalid CLI flags from original script
           orig = orig.replace("--I-KNOW-THIS-IS-INSECURE", "")
           orig = re.sub(r'1280x720|1280x800|1024x768', '1920x1080', orig)
-          orig = re.sub(r'--extensions-dir\s+\S+', '', orig)
+          orig = re.sub(r'--extensions-dir\s+\S+\s*(\\?\n)?', '', orig)
           orig = re.sub(r'(serve-web[\s\S]*?)--user-data-dir', r'\1--server-data-dir', orig)
 
           if "/opt/vscode-arm64/code" in orig and "--disable-gpu" not in orig:
               orig = orig.replace("/opt/vscode-arm64/code", "/opt/vscode-arm64/code --no-sandbox --disable-gpu --disable-dev-shm-usage --disable-software-rasterizer")
+
+          # Replace direct serve-web call with smart-resume wrapper so Mode 2 never throws os error 98 and always resumes session
+          orig = orig.replace("/opt/vscode-arm64/bin/code serve-web", "/usr/local/bin/code-serve-web-smart")
 
           header_patch = """#!/bin/bash
           mkdir -p /tmp /dev/shm /root/.config/Code /root/.vscode-server-data /root/Workspace /usr/local/bin
@@ -201,8 +266,27 @@ jobs:
               sed -i 's|/proc/version|/dev/null|g' /opt/vscode-arm64/bin/code || true
           fi
 
+          # Create Smart Resume Wrapper for Mode 2 (code serve-web)
+          cat > /usr/local/bin/code-serve-web-smart << 'WRAPEOF'
+          #!/bin/bash
+          if pgrep -f "code-tunnel.*serve-web" >/dev/null 2>&1 || pgrep -f "opt/vscode-arm64.*serve-web" >/dev/null 2>&1; then
+              echo "[start-vscode] Resuming existing active Mode 2 session on port 8080..."
+              echo "Web UI available at http://127.0.0.1:8080/?folder=/root/Workspace"
+              while pgrep -f "serve-web" >/dev/null 2>&1; do
+                  sleep 2
+              done
+              exit 0
+          fi
+          exec /opt/vscode-arm64/bin/code serve-web \\
+              --host 127.0.0.1 \\
+              --port 8080 \\
+              --without-connection-token \\
+              --accept-server-license-terms \\
+              --server-data-dir /root/.vscode-server-data
+          WRAPEOF
+          chmod 755 /usr/local/bin/code-serve-web-smart
+
           if [ ! -f /opt/vscode-arm64/.noroot_patched ] && [ -d /opt/vscode-arm64/resources/app/out ]; then
-              echo "[start-vscode] Configuring VS Code non-root user profile..."
               find /opt/vscode-arm64/resources/app/out -name "preload*.js" -exec sed -i 's/process\.getuid()/1000/g' {} + || true
               WB_JS="/opt/vscode-arm64/resources/app/out/vs/workbench/workbench.desktop.main.js"
               if [ -f "$WB_JS" ]; then
@@ -211,23 +295,12 @@ jobs:
               touch /opt/vscode-arm64/.noroot_patched
           fi
 
-          pkill -9 -f "code serve-web" || true
-          pkill -9 -f "code-tunnel" || true
-          pkill -9 -f Xtigervnc || true
-          pkill -9 -f websockify || true
-          pkill -9 -f openbox || true
-          rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1 /tmp/.X*-lock /tmp/.X11-unix/X*
-          sleep 1
-
-          if [ "$1" = "direct" ]; then
-              echo "[start-vscode] Starting Official VS Code Native Workbench Host (code serve-web)..."
-              export USER=coder
-              exec /opt/vscode-arm64/bin/code serve-web \\
-                  --host 127.0.0.1 \\
-                  --port 8080 \\
-                  --without-connection-token \\
-                  --accept-server-license-terms \\
-                  --server-data-dir /root/.vscode-server-data
+          if [ "$1" != "direct" ]; then
+              pkill -9 -f Xtigervnc || true
+              pkill -9 -f websockify || true
+              pkill -9 -f openbox || true
+              rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1 /tmp/.X*-lock /tmp/.X11-unix/X*
+              sleep 1
           fi
           """
 
@@ -240,6 +313,7 @@ jobs:
               f.write(orig)
           os.chmod(script_path, 0o755)
 
+          # Patch Kotlin files so scripts auto-sync, Mode 2 opens inbuilt WorkbenchActivity, and WebView keeps all redirects inside the app
           for root, _, files in os.walk("app/src/main/java"):
               for fn in files:
                   p = os.path.join(root, fn)
@@ -266,19 +340,33 @@ jobs:
                           with open(p, "w", encoding="utf-8") as f:
                               f.write(code)
 
-                  if fn == "WorkbenchActivity.kt":
+                  if fn.endswith(".kt"):
                       with open(p, "r", encoding="utf-8") as f:
                           code = f.read()
-                      code = re.sub(r'startActivity\s*\([^)]*ACTION_VIEW[^)]*\)', '', code)
-                      if "shouldOverrideUrlLoading" not in code and "webView.settings" in code:
-                          wv_client = """
-                          webView.webViewClient = object : android.webkit.WebViewClient() {
-                              override fun shouldOverrideUrlLoading(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): Boolean = false
-                              @Deprecated("Deprecated in Java")
-                              override fun shouldOverrideUrlLoading(view: android.webkit.WebView?, url: String?): Boolean = false
-                          }
-                          """
-                          code = code.replace("webView.settings.javaScriptEnabled = true", "webView.settings.javaScriptEnabled = true\n" + wv_client)
+
+                      # Open default /root/Workspace folder in Mode 2 so user lands right in their project
+                      code = code.replace('"http://127.0.0.1:8080"', '"http://127.0.0.1:8080/?folder=/root/Workspace"')
+                      code = code.replace('"http://127.0.0.1:8080/"', '"http://127.0.0.1:8080/?folder=/root/Workspace"')
+
+                      # Lock WebView right before any .loadUrl( call so it never opens Chrome and auto-retries while server boots
+                      if ".loadUrl(" in code and "shouldOverrideUrlLoading" not in code:
+                          wv_chain = """.apply {
+                              settings.javaScriptEnabled = true
+                              settings.domStorageEnabled = true
+                              settings.databaseEnabled = true
+                              webViewClient = object : android.webkit.WebViewClient() {
+                                  override fun shouldOverrideUrlLoading(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): Boolean = false
+                                  @Deprecated("Deprecated in Java")
+                                  override fun shouldOverrideUrlLoading(view: android.webkit.WebView?, url: String?): Boolean = false
+                                  override fun onReceivedError(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?, error: android.webkit.WebResourceError?) {
+                                      if (request?.isForMainFrame == true) {
+                                          view?.postDelayed({ view.reload() }, 1000)
+                                      }
+                                  }
+                              }
+                          }.loadUrl("""
+                          code = code.replace(".loadUrl(", wv_chain)
+
                       with open(p, "w", encoding="utf-8") as f:
                           f.write(code)
           EOF
@@ -464,7 +552,7 @@ jobs:
           gh release create "$RELEASE_TAG" PocketVSCode-arm64.apk pocket-vscode-permanent.keystore \
             --target "${{ github.sha }}" \
             --title "Pocket VS Code ($RELEASE_TAG)" \
-            --notes "Fixed permanent signing keystore, Mode 1 non-root UI, and Mode 2 in-app webview."
+            --notes "Added official VS Code icon, Mode 2 session auto-resume, and inbuilt WebView lock."
 
       - name: Upload Artifact Backup
         if: always()
