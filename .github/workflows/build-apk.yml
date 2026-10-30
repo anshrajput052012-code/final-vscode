@@ -23,7 +23,7 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Restore Folder Structure and Root Configs
+      - name: Restore Folder Structure and Set New Package ID
         run: |
           for f in app__*; do
             if [ -f "$f" ]; then
@@ -66,29 +66,16 @@ jobs:
           android.nonTransitiveRClass=true
           EOF
 
-      - name: Restore or Generate Permanent Signing Keystore
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p ~/.android app /tmp/keystore_dl
-          RESTORED=false
+          # Use clean package ID com.pocket.vscode to eliminate old signature residuals
+          find app -name "build.gradle.kts" -exec sed -i 's/applicationId = "[^"]*"/applicationId = "com.pocket.vscode"/g' {} + || true
+          find app -name "build.gradle" -exec sed -i 's/applicationId "[^"]*"/applicationId "com.pocket.vscode"/g' {} + || true
 
+      - name: Setup Permanent Keystore and Version
+        run: |
+          mkdir -p ~/.android app
           if [ -f "app/keystore.jks" ]; then
             cp app/keystore.jks ~/.android/debug.keystore
-            RESTORED=true
-          fi
-
-          if [ "$RESTORED" = "false" ]; then
-            if gh release download --pattern "pocket-vscode-permanent.keystore" --dir /tmp/keystore_dl 2>/dev/null; then
-              if [ -f "/tmp/keystore_dl/pocket-vscode-permanent.keystore" ]; then
-                cp /tmp/keystore_dl/pocket-vscode-permanent.keystore ~/.android/debug.keystore
-                cp /tmp/keystore_dl/pocket-vscode-permanent.keystore app/keystore.jks
-                RESTORED=true
-              fi
-            fi
-          fi
-
-          if [ "$RESTORED" = "false" ]; then
+          else
             keytool -genkeypair -v \
               -keystore ~/.android/debug.keystore \
               -alias androiddebugkey \
@@ -99,20 +86,17 @@ jobs:
               -keypass android \
               -dname "CN=PocketVSCode, OU=Dev, O=Standalone, L=Bijnor, ST=UP, C=IN"
             cp ~/.android/debug.keystore app/keystore.jks
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add -f app/keystore.jks || true
+            git commit -m "chore: lock permanent keystore" || true
+            git push origin HEAD:${{ github.ref_name }} || true
           fi
-
-          cp ~/.android/debug.keystore pocket-vscode-permanent.keystore
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f app/keystore.jks || true
-          git commit -m "chore: save permanent keystore" || true
-          git push origin HEAD:${{ github.ref_name }} || true
 
           find app -name "build.gradle.kts" -exec sed -i 's/versionCode = [0-9]*/versionCode = ${{ github.run_number }}/g' {} + || true
           find app -name "build.gradle" -exec sed -i 's/versionCode [0-9]*/versionCode ${{ github.run_number }}/g' {} + || true
 
-      - name: Set App Name and Generate Official VS Code Icons
+      - name: Generate Official Pocket VS Code App Icons
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y python3-pil curl
@@ -121,6 +105,11 @@ jobs:
           cat > app/src/main/res/values/strings.xml << 'EOF'
           <resources>
               <string name="app_name">Pocket VS Code</string>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/values/colors.xml << 'EOF'
+          <resources>
               <color name="ic_launcher_background">#1E1E1E</color>
           </resources>
           EOF
@@ -189,6 +178,8 @@ jobs:
                       c = re.sub(r'android:label="[^"]*"', 'android:label="@string/app_name"', c)
                       with open(mpath, "w", encoding="utf-8") as f:
                           f.write(c)
+
+          print("Generated official Pocket VS Code icon resources.")
           EOF
 
       - name: Pre-Bundle Debian Rootfs and Official VS Code
@@ -232,7 +223,7 @@ jobs:
           EOF
           curl -fSL -H "User-Agent: Mozilla/5.0" "https://update.code.visualstudio.com/latest/linux-arm64/stable" -o app/src/main/assets/vscode-linux-arm64.tar.gz
 
-      - name: Add Auto-Save, Session Persistence, & Battery Optimization
+      - name: Configure Launch Scripts (Full Performance Mode)
         run: |
           python3 - << 'EOF'
           import os, re
@@ -264,7 +255,7 @@ jobs:
               sed -i 's|/proc/version|/dev/null|g' /opt/vscode-arm64/bin/code || true
           fi
 
-          # 1. Configure Auto-Save (500ms), Hot-Exit Session Restore, and Battery-Saving Watcher Exclusions
+          # Auto-Save & Session Persistence across restarts
           for S_PATH in "/root/.config/Code/User/settings.json" "/root/.vscode-server-data/data/Machine/settings.json" "/root/.vscode-server-data/data/User/settings.json"; do
               if [ ! -f "$S_PATH" ]; then
                   cat > "$S_PATH" << 'JSONEOF'
@@ -273,59 +264,24 @@ jobs:
               "files.autoSaveDelay": 500,
               "files.hotExit": "onExitAndWindowClose",
               "window.restoreWindows": "all",
-              "workbench.startupEditor": "none",
-              "telemetry.telemetryLevel": "off",
-              "extensions.autoCheckUpdates": false,
-              "extensions.autoUpdate": false,
-              "update.mode": "none",
-              "files.watcherExclude": {
-                  "**/.git/objects/**": true,
-                  "**/.git/subtree-cache/**": true,
-                  "**/node_modules/*/**": true,
-                  "**/.hg/store/**": true,
-                  "**/build/**": true,
-                  "**/.gradle/**": true
-              }
+              "workbench.startupEditor": "none"
           }
           JSONEOF
               fi
           done
 
-          # 2. Smart Mode 2 Wrapper with Battery-Saving Idle Auto-Hibernation (stops after 10 mins of no browser connection)
+          # Standard Full-Performance Runner (No auto-kill / No hibernation)
           cat > /usr/local/bin/code-serve-web-smart << 'WRAPEOF'
           #!/bin/bash
-          start_idle_watcher() {
-              (
-                  IDLE_SECONDS=0
-                  while pgrep -f "serve-web" >/dev/null 2>&1; do
-                      sleep 30
-                      # Check /proc/net/tcp for ESTABLished (01) connections on port 8080 (hex 1F90)
-                      if grep -q ":1F90 .* 01 " /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
-                          IDLE_SECONDS=0
-                      else
-                          IDLE_SECONDS=$((IDLE_SECONDS + 30))
-                      fi
-                      # Hibernate server after 600s (10 mins) of closed website to save 100% background battery
-                      if [ "$IDLE_SECONDS" -ge 600 ]; then
-                          echo "[battery-saver] Mode 2 website closed for 10 mins. Auto-saving and hibernating server..."
-                          pkill -15 -f "serve-web" || true
-                          exit 0
-                      fi
-                  done
-              ) &
-          }
-
           if pgrep -f "code-tunnel.*serve-web" >/dev/null 2>&1 || pgrep -f "opt/vscode-arm64.*serve-web" >/dev/null 2>&1; then
-              echo "[start-vscode] Resuming active Mode 2 session on port 8080..."
-              echo "Web UI available at http://127.0.0.1:8080/?folder=/root/Workspace"
+              echo "[start-vscode] Resuming active Mode 2 session..."
               while pgrep -f "serve-web" >/dev/null 2>&1; do
                   sleep 3
               done
               exit 0
           fi
 
-          start_idle_watcher
-          exec nice -n 5 /opt/vscode-arm64/bin/code serve-web \\
+          exec /opt/vscode-arm64/bin/code serve-web \\
               --host 127.0.0.1 \\
               --port 8080 \\
               --without-connection-token \\
@@ -411,26 +367,6 @@ jobs:
                               }
                           }.loadUrl("""
                           code = code.replace(".loadUrl(", wv_chain)
-
-                      # Add WebView lifecycle battery saver + auto-blur flush when user leaves WorkbenchActivity
-                      if fn == "WorkbenchActivity.kt" and "override fun onPause()" not in code:
-                          lifecycle_patch = """
-                          override fun onPause() {
-                              try {
-                                  webView.evaluateJavascript("window.dispatchEvent(new Event('blur')); document.dispatchEvent(new Event('visibilitychange'));", null)
-                                  webView.onPause()
-                              } catch (_: Exception) {}
-                              super.onPause()
-                          }
-
-                          override fun onResume() {
-                              super.onResume()
-                              try {
-                                  webView.onResume()
-                              } catch (_: Exception) {}
-                          }
-                          """
-                          code = re.sub(r'(\}\s*)$', lifecycle_patch + "\n}", code, count=1)
 
                       with open(p, "w", encoding="utf-8") as f:
                           f.write(code)
@@ -603,21 +539,21 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
 
-      - name: Assemble Standalone APK
+      - name: Assemble Standalone APK with Full Signing
         run: |
           gradle wrapper --gradle-version 8.7
           ./gradlew assembleDebug --stacktrace
           cp app/build/outputs/apk/debug/app-debug.apk PocketVSCode-arm64.apk
 
-      - name: Publish Direct APK & Keystore to GitHub Releases
+      - name: Publish Direct APK to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           RELEASE_TAG="v1.0.${{ github.run_number }}"
-          gh release create "$RELEASE_TAG" PocketVSCode-arm64.apk pocket-vscode-permanent.keystore \
+          gh release create "$RELEASE_TAG" PocketVSCode-arm64.apk \
             --target "${{ github.sha }}" \
             --title "Pocket VS Code ($RELEASE_TAG)" \
-            --notes "Added Mode 2 Auto-Save, Session State Persistence, and Idle Battery Hibernation."
+            --notes "Full performance build with new package ID com.pocket.vscode and official VS Code logo."
 
       - name: Upload Artifact Backup
         if: always()
