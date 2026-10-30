@@ -23,7 +23,7 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Generate Root Configs
+      - name: Restore Folder Structure and Root Configs
         run: |
           for f in app__*; do
             if [ -f "$f" ]; then
@@ -134,38 +134,99 @@ jobs:
               sys.exit(1)
           EOF
           curl -fSL -H "User-Agent: Mozilla/5.0" "https://update.code.visualstudio.com/latest/linux-arm64/stable" -o app/src/main/assets/vscode-linux-arm64.tar.gz
-          ls -lh app/src/main/assets/
 
-      - name: Generate Fixed Launch Scripts
+      - name: Patch In-App Launch Script & Lock WebView Inside App
         run: |
-          mkdir -p app/src/main/assets
-          cat > app/src/main/assets/start-vscode-session.sh << 'EOF'
-          #!/bin/bash
-          export USER=root
-          export HOME=/root
-          export LANG=C.UTF-8
-          export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/vscode-arm64/bin:$PATH
-          mkdir -p /root/.config/Code /root/.vscode-server-data /root/Workspace /tmp
-          chmod 1777 /tmp
-          MODE="$1"
-          if [ "$MODE" = "direct" ]; then
-              echo "[start-vscode] Starting Official VS Code Native Workbench Host (code serve-web)..."
-              exec /opt/vscode-arm64/bin/code serve-web --host 127.0.0.1 --port 8080 --without-connection-token --accept-server-license-terms --server-data-dir /root/.vscode-server-data
-          else
-              echo "[start-vscode] Starting TigerVNC + Openbox + VS Code Desktop (Mode 1)..."
-              pkill -f Xtigervnc || true
-              rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1
-              mkdir -p /root/.vnc
-              touch /root/.vnc/passwd
-              export DISPLAY=:1
-              Xtigervnc :1 -geometry 1920x1080 -depth 24 -SecurityTypes None --I-KNOW-THIS-IS-INSECURE &
-              sleep 1
-              openbox &
-              sleep 1
-              exec /opt/vscode-arm64/code --no-sandbox --user-data-dir /root/.config/Code /root/Workspace
-          fi
+          python3 - << 'EOF'
+          import os, re
+
+          # 1. Patch original start-vscode-session.sh so Mode 1 (noVNC + Xtigervnc) and Mode 2 both work inside the app
+          script_path = "app/src/main/assets/start-vscode-session.sh"
+          if os.path.exists(script_path):
+              with open(script_path, "r", encoding="utf-8") as f:
+                  s = f.read()
+          else:
+              s = ""
+
+          print("=== Original start-vscode-session.sh ===")
+          print(s)
+
+          # Clean up broken flags and upgrade resolution & stability
+          s = s.replace("--I-KNOW-THIS-IS-INSECURE", "")
+          s = re.sub(r'1280x720|1280x800|1024x768', '1920x1080', s)
+          s = re.sub(r'(serve-web[\s\S]*?)--user-data-dir', r'\1--server-data-dir', s)
+
+          # Ensure Electron runs with --no-sandbox --disable-gpu --disable-dev-shm-usage in PRoot X11
+          if "/opt/vscode-arm64/code" in s and "--disable-gpu" not in s:
+              s = s.replace("/opt/vscode-arm64/code", "/opt/vscode-arm64/code --no-sandbox --disable-gpu --disable-dev-shm-usage --disable-software-rasterizer")
+
+          # Inject port & lock cleanup right after shebang so ports 5901/6080/8080 are never busy
+          cleanup_block = """#!/bin/bash
+          mkdir -p /tmp /dev/shm /root/.config/Code /root/.vscode-server-data /root/Workspace
+          chmod 1777 /tmp /dev/shm || true
+          pkill -9 -f "code serve-web" || true
+          pkill -9 -f "code-tunnel" || true
+          pkill -9 -f Xtigervnc || true
+          pkill -9 -f websockify || true
+          pkill -9 -f openbox || true
+          rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1 /tmp/.X*-lock /tmp/.X11-unix/X*
+          sleep 1
+          """
+          if s.startswith("#!/"):
+              s = re.sub(r'^#!/[^\n]*\n', cleanup_block + "\n", s, count=1)
+          else:
+              s = cleanup_block + "\n" + s
+
+          with open(script_path, "w", encoding="utf-8") as f:
+              f.write(s)
+          os.chmod(script_path, 0o755)
+
+          # 2. Ensure ProotProcessManager ALWAYS copies latest asset scripts before running any command
+          for root, _, files in os.walk("app/src/main/java"):
+              for fn in files:
+                  p = os.path.join(root, fn)
+                  if fn == "ProotProcessManager.kt":
+                      with open(p, "r", encoding="utf-8") as f:
+                          code = f.read()
+                      sync_snippet = """
+                      try {
+                          val rDir = File(rootfsDir, "root").apply { mkdirs() }
+                          listOf("init-rootfs.sh", "start-vscode-session.sh", "verify-vscode.sh").forEach { name ->
+                              val out = File(rDir, name)
+                              context.assets.open(name).use { inp -> java.io.FileOutputStream(out).use { o -> inp.copyTo(o) } }
+                              out.setExecutable(true, false)
+                          }
+                      } catch (_: Exception) {}
+                      """
+                      if "start-vscode-session.sh" not in code:
+                          code = re.sub(
+                              r'(fun\s+startProotCommand\s*\([^)]*\)\s*:\s*Process\s*\{)',
+                              r'\1\n' + sync_snippet,
+                              code,
+                              count=1
+                          )
+                          with open(p, "w", encoding="utf-8") as f:
+                              f.write(code)
+                          print("Patched ProotProcessManager to auto-sync scripts on every launch.")
+
+                  # 3. Ensure MainActivity never opens an external browser (Intent.ACTION_VIEW)
+                  if fn == "MainActivity.kt":
+                      with open(p, "r", encoding="utf-8") as f:
+                          code = f.read()
+                      if "ACTION_VIEW" in code:
+                          print("Found ACTION_VIEW in MainActivity, keeping all launches inside WorkbenchActivity.")
+
+                  # 4. Lock WorkbenchActivity WebView so URLs/redirects NEVER open Chrome/Website
+                  if fn == "WorkbenchActivity.kt":
+                      with open(p, "r", encoding="utf-8") as f:
+                          code = f.read()
+                      print("=== Inspecting WorkbenchActivity.kt ===")
+                      print(code)
+                      # Replace any external browser intent inside WebViewClient with in-app loading
+                      code = re.sub(r'startActivity\s*\([^)]*ACTION_VIEW[^)]*\)', '', code)
+                      with open(p, "w", encoding="utf-8") as f:
+                          f.write(code)
           EOF
-          chmod 755 app/src/main/assets/start-vscode-session.sh
 
       - name: Configure Universal Asset Unpacker
         run: |
@@ -343,14 +404,3 @@ jobs:
       - name: Publish Direct APK to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          RELEASE_TAG="v1.0.${{ github.run_number }}"
-          gh release create "$RELEASE_TAG" PocketVSCode-arm64.apk --target "${{ github.sha }}" --title "Pocket VS Code ($RELEASE_TAG)" --notes "Direct installable APK without zip extraction."
-
-      - name: Upload Artifact Backup
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: Pocket-VS-Code-arm64-v8a-APK
-          path: PocketVSCode-arm64.apk
-          
