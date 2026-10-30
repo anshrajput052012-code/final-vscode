@@ -116,7 +116,6 @@ jobs:
           rm -rf app/src/main/res/mipmap-anydpi*
           rm -rf app/src/main/res/drawable*/ic_launcher*
 
-          # Download high-res official Microsoft Fluent Blue Ribbon icon reliably from CDN
           curl -fSL "https://cdn.jsdelivr.net/gh/microsoft/vscode/resources/linux/code.png" -o vscode_ribbon.png || \
           curl -fSL "https://raw.githubusercontent.com/microsoft/vscode/main/resources/linux/code.png" -o vscode_ribbon.png
 
@@ -151,12 +150,10 @@ jobs:
               dest_dir = os.path.join("app/src/main/res", folder)
               os.makedirs(dest_dir, exist_ok=True)
 
-              # Clean transparent legacy icon (Direct ribbon without black box)
               legacy_icon = img.resize((legacy_size, legacy_size), Image.Resampling.LANCZOS)
               legacy_icon.save(os.path.join(dest_dir, "ic_launcher.png"))
               legacy_icon.save(os.path.join(dest_dir, "ic_launcher_round.png"))
 
-              # Adaptive foreground with safe-zone margin
               fg = Image.new("RGBA", (adaptive_size, adaptive_size), (0, 0, 0, 0))
               inner_adapt = int(adaptive_size * 0.72)
               resized_adapt = img.resize((inner_adapt, inner_adapt), Image.Resampling.LANCZOS)
@@ -182,7 +179,7 @@ jobs:
                       with open(mpath, "w", encoding="utf-8") as f:
                           f.write(c)
 
-          print("Generated clean Fluent Ribbon Icons successfully.")
+          print("Generated Fluent Ribbon Icons successfully.")
           EOF
 
       - name: Pre-Bundle Debian Rootfs and Official VS Code
@@ -317,63 +314,9 @@ jobs:
           with open(script_path, "w", encoding="utf-8") as f:
               f.write(orig)
           os.chmod(script_path, 0o755)
-
-          for root, _, files in os.walk("app/src/main/java"):
-              for fn in files:
-                  p = os.path.join(root, fn)
-                  if fn == "ProotProcessManager.kt":
-                      with open(p, "r", encoding="utf-8") as f:
-                          code = f.read()
-                      sync_snippet = """
-                      try {
-                          val rDir = File(rootfsDir, "root").apply { mkdirs() }
-                          listOf("init-rootfs.sh", "start-vscode-session.sh", "verify-vscode.sh").forEach { name ->
-                              val out = File(rDir, name)
-                              context.assets.open(name).use { inp -> java.io.FileOutputStream(out).use { o -> inp.copyTo(o) } }
-                              out.setExecutable(true, false)
-                          }
-                      } catch (_: Exception) {}
-                      """
-                      if "start-vscode-session.sh" not in code:
-                          code = re.sub(
-                              r'(fun\s+startProotCommand\s*\([^)]*\)\s*:\s*Process\s*\{)',
-                              r'\1\n' + sync_snippet,
-                              code,
-                              count=1
-                          )
-                          with open(p, "w", encoding="utf-8") as f:
-                              f.write(code)
-
-                  if fn.endswith(".kt"):
-                      with open(p, "r", encoding="utf-8") as f:
-                          code = f.read()
-
-                      code = code.replace('"http://127.0.0.1:8080"', '"http://127.0.0.1:8080/?folder=/root/Workspace"')
-                      code = code.replace('"http://127.0.0.1:8080/"', '"http://127.0.0.1:8080/?folder=/root/Workspace"')
-
-                      if ".loadUrl(" in code and "shouldOverrideUrlLoading" not in code:
-                          wv_chain = """.apply {
-                              settings.javaScriptEnabled = true
-                              settings.domStorageEnabled = true
-                              settings.databaseEnabled = true
-                              webViewClient = object : android.webkit.WebViewClient() {
-                                  override fun shouldOverrideUrlLoading(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): Boolean = false
-                                  @Deprecated("Deprecated in Java")
-                                  override fun shouldOverrideUrlLoading(view: android.webkit.WebView?, url: String?): Boolean = false
-                                  override fun onReceivedError(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?, error: android.webkit.WebResourceError?) {
-                                      if (request?.isForMainFrame == true) {
-                                          view?.postDelayed({ view.reload() }, 1000)
-                                      }
-                                  }
-                              }
-                          }.loadUrl("""
-                          code = code.replace(".loadUrl(", wv_chain)
-
-                      with open(p, "w", encoding="utf-8") as f:
-                          f.write(code)
           EOF
 
-      - name: Inject Zero-Click Auto-Launch in MainActivity
+      - name: Inject Safe Zero-Click Auto-Launch in MainActivity
         run: |
           python3 - << 'EOF'
           import os, re
@@ -385,36 +328,47 @@ jobs:
                       with open(p, "r", encoding="utf-8") as f:
                           code = f.read()
 
-                      auto_launch_block = """
-                              val isBashReady = java.io.File(prootManager.rootfsDir, "bin/bash").exists()
-                              val isCodeReady = java.io.File(prootManager.rootfsDir, "opt/vscode-arm64/bin/code").exists()
+                      # Revert any previously broken injection
+                      code = re.sub(r'// Auto-Launch Genuine VS Code[\s\S]*?performClick\(\)\s*\}', '', code)
+                      code = re.sub(r'logOutput\(.*?\)', '', code)
 
-                              if (isBashReady && isCodeReady) {
-                                  logOutput("Installed VS Code detected. Auto-launching Workbench...")
-                                  findViewById<android.view.View>(resources.getIdentifier("btnLaunch", "id", packageName))?.performClick()
-                              } else {
-                                  logOutput("First launch detected. Setting up Pocket VS Code automatically...")
-                                  findViewById<android.view.View>(resources.getIdentifier("btnInstall", "id", packageName))?.performClick()
-                              }
+                      # Safe UI traversal auto-launch: Runs after activity layout renders completely
+                      safe_autolaunch = """
+                              window.decorView.postDelayed({
+                                  fun findButton(v: android.view.View, keyword: String): android.widget.Button? {
+                                      if (v is android.widget.Button && v.text.toString().uppercase().contains(keyword)) return v
+                                      if (v is android.view.ViewGroup) {
+                                          for (i in 0 until v.childCount) {
+                                              val b = findButton(v.getChildAt(i), keyword)
+                                              if (b != null) return b
+                                          }
+                                      }
+                                      return null
+                                  }
+
+                                  val isInstalled = java.io.File(filesDir, "debian-rootfs/bin/bash").exists() || 
+                                                    java.io.File(filesDir, "rootfs/bin/bash").exists() ||
+                                                    java.io.File(filesDir, "usr/bin/bash").exists()
+
+                                  if (isInstalled) {
+                                      findButton(window.decorView, "LAUNCH")?.performClick()
+                                  } else {
+                                      findButton(window.decorView, "INSTALL")?.performClick()
+                                  }
+                              }, 1200)
                       """
 
-                      if "Auto-launching Workbench" not in code:
+                      if "findButton(window.decorView" not in code:
                           code = re.sub(
-                              r'(override\s+fun\s+onCreate[^{]+\{[\s\S]*?)(setContentView\([^)]+\))',
-                              r'\1\2\n' + auto_launch_block,
+                              r'(override\s+fun\s+onCreate[^{]+\{[\s\S]*?setContentView\([^)]+\))',
+                              r'\1\n' + safe_autolaunch,
                               code,
                               count=1
                           )
 
-                      if "performClick()" in code and "Provisioning finished with code 0" not in code:
-                          code = code.replace(
-                              'if (success) {',
-                              'if (success) {\n                runOnUiThread { findViewById<android.view.View>(resources.getIdentifier("btnLaunch", "id", packageName))?.performClick() }'
-                          )
-
                       with open(p, "w", encoding="utf-8") as f:
                           f.write(code)
-                      print("Injected Zero-Click Auto-Launch successfully into MainActivity.")
+                      print("Injected safe Zero-Click Auto-Launch.")
           EOF
 
       - name: Configure Universal Asset Unpacker
@@ -598,7 +552,7 @@ jobs:
           gh release create "$RELEASE_TAG" PocketVSCode-arm64.apk \
             --target "${{ github.sha }}" \
             --title "Pocket VS Code ($RELEASE_TAG)" \
-            --notes "Zero-click direct auto-launch with clean Fluent ribbon VS Code icon."
+            --notes "Fixed Gradle compilation error. Direct auto-launch with official Fluent ribbon VS Code icon."
 
       - name: Upload Artifact Backup
         if: always()
