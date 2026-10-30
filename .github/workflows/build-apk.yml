@@ -66,21 +66,57 @@ jobs:
           android.nonTransitiveRClass=true
           EOF
 
-      - name: Setup Permanent Keystore and Version
+      - name: Restore or Generate Permanent Signing Keystore
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mkdir -p ~/.android
+          mkdir -p ~/.android app /tmp/keystore_dl
+          RESTORED=false
+
+          # 1. Try restoring from repo if exists
           if [ -f "app/keystore.jks" ]; then
+            echo "Keystore found in repository."
             cp app/keystore.jks ~/.android/debug.keystore
-          else
-            keytool -genkeypair -v -keystore ~/.android/debug.keystore -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=PocketVSCode, OU=Dev, O=Standalone, L=Bijnor, ST=UP, C=IN"
-            mkdir -p app
-            cp ~/.android/debug.keystore app/keystore.jks
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add app/keystore.jks
-            git commit -m "chore: save permanent keystore" || true
-            git push origin HEAD:${{ github.ref_name }} || true
+            RESTORED=true
           fi
+
+          # 2. Try downloading permanent keystore from previous releases
+          if [ "$RESTORED" = "false" ]; then
+            echo "Searching previous GitHub releases for permanent keystore..."
+            if gh release download --pattern "pocket-vscode-permanent.keystore" --dir /tmp/keystore_dl 2>/dev/null; then
+              if [ -f "/tmp/keystore_dl/pocket-vscode-permanent.keystore" ]; then
+                echo "Successfully restored permanent keystore from GitHub Release."
+                cp /tmp/keystore_dl/pocket-vscode-permanent.keystore ~/.android/debug.keystore
+                cp /tmp/keystore_dl/pocket-vscode-permanent.keystore app/keystore.jks
+                RESTORED=true
+              fi
+            fi
+          fi
+
+          # 3. If first run, generate the permanent key once
+          if [ "$RESTORED" = "false" ]; then
+            echo "Creating initial permanent keystore..."
+            keytool -genkeypair -v \
+              -keystore ~/.android/debug.keystore \
+              -alias androiddebugkey \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass android \
+              -keypass android \
+              -dname "CN=PocketVSCode, OU=Dev, O=Standalone, L=Bijnor, ST=UP, C=IN"
+            cp ~/.android/debug.keystore app/keystore.jks
+          fi
+
+          cp ~/.android/debug.keystore pocket-vscode-permanent.keystore
+
+          # Force add keystore to bypass .gitignore rules
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f app/keystore.jks || true
+          git commit -m "chore: save permanent keystore" || true
+          git push origin HEAD:${{ github.ref_name }} || true
+
           find app -name "build.gradle.kts" -exec sed -i 's/versionCode = [0-9]*/versionCode = ${{ github.run_number }}/g' {} + || true
           find app -name "build.gradle" -exec sed -i 's/versionCode [0-9]*/versionCode ${{ github.run_number }}/g' {} + || true
 
@@ -144,7 +180,6 @@ jobs:
           with open(script_path, "r", encoding="utf-8") as f:
               orig = f.read()
 
-          # Remove any broken flags from original script
           orig = orig.replace("--I-KNOW-THIS-IS-INSECURE", "")
           orig = re.sub(r'1280x720|1280x800|1024x768', '1920x1080', orig)
           orig = re.sub(r'--extensions-dir\s+\S+', '', orig)
@@ -157,18 +192,15 @@ jobs:
           mkdir -p /tmp /dev/shm /root/.config/Code /root/.vscode-server-data /root/Workspace /usr/local/bin
           chmod 1777 /tmp /dev/shm || true
 
-          # 1. Provide sudo wrapper so user commands work like a standard Linux user
           if [ ! -f /usr/local/bin/sudo ]; then
               printf '#!/bin/sh\\nexec "$@"\\n' > /usr/local/bin/sudo
               chmod 755 /usr/local/bin/sudo
           fi
 
-          # 2. Silence /proc/version permission warning in VS Code launcher scripts
           if [ -f /opt/vscode-arm64/bin/code ]; then
               sed -i 's|/proc/version|/dev/null|g' /opt/vscode-arm64/bin/code || true
           fi
 
-          # 3. Patch VS Code Workbench & Preload so it runs as normal user (UID 1000) without [Superuser] or root warning
           if [ ! -f /opt/vscode-arm64/.noroot_patched ] && [ -d /opt/vscode-arm64/resources/app/out ]; then
               echo "[start-vscode] Configuring VS Code non-root user profile..."
               find /opt/vscode-arm64/resources/app/out -name "preload*.js" -exec sed -i 's/process\.getuid()/1000/g' {} + || true
@@ -179,7 +211,6 @@ jobs:
               touch /opt/vscode-arm64/.noroot_patched
           fi
 
-          # 4. Clean up stale processes and locks before starting session
           pkill -9 -f "code serve-web" || true
           pkill -9 -f "code-tunnel" || true
           pkill -9 -f Xtigervnc || true
@@ -188,7 +219,6 @@ jobs:
           rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1 /tmp/.X*-lock /tmp/.X11-unix/X*
           sleep 1
 
-          # 5. If Mode 2 (direct) is selected, launch clean serve-web without invalid flags
           if [ "$1" = "direct" ]; then
               echo "[start-vscode] Starting Official VS Code Native Workbench Host (code serve-web)..."
               export USER=coder
@@ -210,7 +240,6 @@ jobs:
               f.write(orig)
           os.chmod(script_path, 0o755)
 
-          # Patch ProotProcessManager & WorkbenchActivity so scripts auto-update and Mode 2 stays inside WebView
           for root, _, files in os.walk("app/src/main/java"):
               for fn in files:
                   p = os.path.join(root, fn)
@@ -240,7 +269,6 @@ jobs:
                   if fn == "WorkbenchActivity.kt":
                       with open(p, "r", encoding="utf-8") as f:
                           code = f.read()
-                      # Force all WebView navigation and redirects to stay inside the app
                       code = re.sub(r'startActivity\s*\([^)]*ACTION_VIEW[^)]*\)', '', code)
                       if "shouldOverrideUrlLoading" not in code and "webView.settings" in code:
                           wv_client = """
@@ -428,12 +456,15 @@ jobs:
           ./gradlew assembleDebug --stacktrace
           cp app/build/outputs/apk/debug/app-debug.apk PocketVSCode-arm64.apk
 
-      - name: Publish Direct APK to GitHub Releases
+      - name: Publish Direct APK & Keystore to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           RELEASE_TAG="v1.0.${{ github.run_number }}"
-          gh release create "$RELEASE_TAG" PocketVSCode-arm64.apk --target "${{ github.sha }}" --title "Pocket VS Code ($RELEASE_TAG)" --notes "Fixed Mode 2 (--extensions-dir removed) and Mode 1 non-root user profile."
+          gh release create "$RELEASE_TAG" PocketVSCode-arm64.apk pocket-vscode-permanent.keystore \
+            --target "${{ github.sha }}" \
+            --title "Pocket VS Code ($RELEASE_TAG)" \
+            --notes "Fixed permanent signing keystore, Mode 1 non-root UI, and Mode 2 in-app webview."
 
       - name: Upload Artifact Backup
         if: always()
