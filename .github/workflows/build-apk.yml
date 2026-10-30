@@ -66,7 +66,6 @@ jobs:
           android.nonTransitiveRClass=true
           EOF
 
-          # Use clean package ID com.pocket.vscode to eliminate old signature residuals
           find app -name "build.gradle.kts" -exec sed -i 's/applicationId = "[^"]*"/applicationId = "com.pocket.vscode"/g' {} + || true
           find app -name "build.gradle" -exec sed -i 's/applicationId "[^"]*"/applicationId "com.pocket.vscode"/g' {} + || true
 
@@ -96,7 +95,7 @@ jobs:
           find app -name "build.gradle.kts" -exec sed -i 's/versionCode = [0-9]*/versionCode = ${{ github.run_number }}/g' {} + || true
           find app -name "build.gradle" -exec sed -i 's/versionCode [0-9]*/versionCode ${{ github.run_number }}/g' {} + || true
 
-      - name: Generate Official Pocket VS Code App Icons
+      - name: Generate Exact Fluent Blue Ribbon App Icons
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y python3-pil curl
@@ -110,20 +109,24 @@ jobs:
 
           cat > app/src/main/res/values/colors.xml << 'EOF'
           <resources>
-              <color name="ic_launcher_background">#1E1E1E</color>
+              <color name="ic_launcher_background">#181818</color>
           </resources>
           EOF
 
           rm -rf app/src/main/res/mipmap-anydpi*
           rm -rf app/src/main/res/drawable*/ic_launcher*
 
-          curl -sL "https://raw.githubusercontent.com/microsoft/vscode/main/resources/linux/code.png" -o vscode_icon.png
+          # Fetch official 1024px High-Res Modern Fluent Blue Ribbon Logo
+          curl -sL "https://upload.wikimedia.org/wikipedia/commons/thumb/9/9a/Visual_Studio_Code_1.35_icon.svg/1024px-Visual_Studio_Code_1.35_icon.svg.png" -o vscode_ribbon.png
+          if [ ! -s vscode_ribbon.png ]; then
+              curl -sL "https://raw.githubusercontent.com/microsoft/vscode/main/resources/linux/code.png" -o vscode_ribbon.png
+          fi
 
           python3 - << 'EOF'
           import os, re
           from PIL import Image
 
-          img = Image.open("vscode_icon.png").convert("RGBA")
+          img = Image.open("vscode_ribbon.png").convert("RGBA")
 
           v26_dir = "app/src/main/res/mipmap-anydpi-v26"
           os.makedirs(v26_dir, exist_ok=True)
@@ -150,15 +153,21 @@ jobs:
               dest_dir = os.path.join("app/src/main/res", folder)
               os.makedirs(dest_dir, exist_ok=True)
 
-              legacy_icon = img.resize((legacy_size, legacy_size), Image.Resampling.LANCZOS)
-              legacy_icon.save(os.path.join(dest_dir, "ic_launcher.png"))
-              legacy_icon.save(os.path.join(dest_dir, "ic_launcher_round.png"))
+              # Legacy standalone icon with dark round background
+              bg = Image.new("RGBA", (legacy_size, legacy_size), (24, 24, 24, 255))
+              inner_legacy = int(legacy_size * 0.82)
+              resized_legacy = img.resize((inner_legacy, inner_legacy), Image.Resampling.LANCZOS)
+              offset_l = (legacy_size - inner_legacy) // 2
+              bg.paste(resized_legacy, (offset_l, offset_l), resized_legacy)
+              bg.save(os.path.join(dest_dir, "ic_launcher.png"))
+              bg.save(os.path.join(dest_dir, "ic_launcher_round.png"))
 
+              # Adaptive foreground with standard safe-zone margin
               fg = Image.new("RGBA", (adaptive_size, adaptive_size), (0, 0, 0, 0))
-              inner_size = int(adaptive_size * 0.66)
-              inner_img = img.resize((inner_size, inner_size), Image.Resampling.LANCZOS)
-              offset = (adaptive_size - inner_size) // 2
-              fg.paste(inner_img, (offset, offset), inner_img)
+              inner_adapt = int(adaptive_size * 0.65)
+              resized_adapt = img.resize((inner_adapt, inner_adapt), Image.Resampling.LANCZOS)
+              offset_a = (adaptive_size - inner_adapt) // 2
+              fg.paste(resized_adapt, (offset_a, offset_a), resized_adapt)
               fg.save(os.path.join(dest_dir, "ic_launcher_foreground.png"))
 
           for root, _, files in os.walk("app/src/main"):
@@ -179,7 +188,7 @@ jobs:
                       with open(mpath, "w", encoding="utf-8") as f:
                           f.write(c)
 
-          print("Generated official Pocket VS Code icon resources.")
+          print("Generated exact Fluent Ribbon Icon across all resolutions.")
           EOF
 
       - name: Pre-Bundle Debian Rootfs and Official VS Code
@@ -223,7 +232,7 @@ jobs:
           EOF
           curl -fSL -H "User-Agent: Mozilla/5.0" "https://update.code.visualstudio.com/latest/linux-arm64/stable" -o app/src/main/assets/vscode-linux-arm64.tar.gz
 
-      - name: Configure Launch Scripts (Full Performance Mode)
+      - name: Configure Launch Scripts with Auto-Save & Non-Root UI
         run: |
           python3 - << 'EOF'
           import os, re
@@ -255,7 +264,6 @@ jobs:
               sed -i 's|/proc/version|/dev/null|g' /opt/vscode-arm64/bin/code || true
           fi
 
-          # Auto-Save & Session Persistence across restarts
           for S_PATH in "/root/.config/Code/User/settings.json" "/root/.vscode-server-data/data/Machine/settings.json" "/root/.vscode-server-data/data/User/settings.json"; do
               if [ ! -f "$S_PATH" ]; then
                   cat > "$S_PATH" << 'JSONEOF'
@@ -270,13 +278,12 @@ jobs:
               fi
           done
 
-          # Standard Full-Performance Runner (No auto-kill / No hibernation)
           cat > /usr/local/bin/code-serve-web-smart << 'WRAPEOF'
           #!/bin/bash
           if pgrep -f "code-tunnel.*serve-web" >/dev/null 2>&1 || pgrep -f "opt/vscode-arm64.*serve-web" >/dev/null 2>&1; then
               echo "[start-vscode] Resuming active Mode 2 session..."
               while pgrep -f "serve-web" >/dev/null 2>&1; do
-                  sleep 3
+                  sleep 2
               done
               exit 0
           fi
@@ -317,6 +324,7 @@ jobs:
               f.write(orig)
           os.chmod(script_path, 0o755)
 
+          # Auto-sync launch scripts in ProotProcessManager
           for root, _, files in os.walk("app/src/main/java"):
               for fn in files:
                   p = os.path.join(root, fn)
@@ -372,6 +380,54 @@ jobs:
                           f.write(code)
           EOF
 
+      - name: Inject Zero-Click Auto-Launch in MainActivity
+        run: |
+          python3 - << 'EOF'
+          import os, re
+
+          for root, _, files in os.walk("app/src/main/java"):
+              for fn in files:
+                  if fn == "MainActivity.kt":
+                      p = os.path.join(root, fn)
+                      with open(p, "r", encoding="utf-8") as f:
+                          code = f.read()
+
+                      # Auto-launch trigger right after onCreate UI finishes
+                      auto_launch_block = """
+                              // Auto-Launch Genuine VS Code directly on start
+                              val isBashReady = java.io.File(prootManager.rootfsDir, "bin/bash").exists()
+                              val isCodeReady = java.io.File(prootManager.rootfsDir, "opt/vscode-arm64/bin/code").exists()
+
+                              if (isBashReady && isCodeReady) {
+                                  logOutput("Installed VS Code detected. Auto-launching Workbench...")
+                                  findViewById<android.view.View>(resources.getIdentifier("btnLaunch", "id", packageName))?.performClick()
+                              } else {
+                                  logOutput("First launch detected. Setting up Pocket VS Code automatically...")
+                                  findViewById<android.view.View>(resources.getIdentifier("btnInstall", "id", packageName))?.performClick()
+                              }
+                      """
+
+                      if "Auto-launching Workbench" not in code:
+                          # Inject after onCreate ends
+                          code = re.sub(
+                              r'(override\s+fun\s+onCreate[^{]+\{[\s\S]*?)(setContentView\([^)]+\))',
+                              r'\1\2\n' + auto_launch_block,
+                              code,
+                              count=1
+                          )
+
+                      # Chain launch automatically when provisioning finishes on first run
+                      if "performClick()" in code and "Provisioning finished with code 0" not in code:
+                          code = code.replace(
+                              'if (success) {',
+                              'if (success) {\n                runOnUiThread { findViewById<android.view.View>(resources.getIdentifier("btnLaunch", "id", packageName))?.performClick() }'
+                          )
+
+                      with open(p, "w", encoding="utf-8") as f:
+                          f.write(code)
+                      print("Injected Zero-Click Auto-Launch successfully into MainActivity.")
+          EOF
+
       - name: Configure Universal Asset Unpacker
         run: |
           STANDALONE_PROV="app/src/main/java/com/vscode/desktop/standalone/StandaloneProvisioner.kt"
@@ -393,7 +449,7 @@ jobs:
                   return try {
                       exportAssetScripts()
                       if (!File(prootManager.rootfsDir, "bin/bash").exists()) {
-                          onProgress("1/3 Extracting Bundled Debian Rootfs from APK (Offline)...")
+                          onProgress("1/3 Setting up Linux Environment...")
                           val assetList = context.assets.list("") ?: emptyArray()
                           val rootfsAsset = assetList.firstOrNull { it.startsWith("debian-rootfs.tar") }
                               ?: throw IOException("Pre-bundled debian-rootfs asset not found!")
@@ -401,13 +457,13 @@ jobs:
                               extractTarFromStream(input, prootManager.rootfsDir, onProgress)
                           }
                       } else {
-                          onProgress("1/3 Debian Rootfs already installed.")
+                          onProgress("1/3 Linux Environment ready.")
                       }
 
                       val vscodeDir = File(prootManager.rootfsDir, "opt/vscode-arm64")
                       if (!File(vscodeDir, "bin/code").exists()) {
                           vscodeDir.mkdirs()
-                          onProgress("2/3 Extracting Bundled Microsoft VS Code from APK (Offline)...")
+                          onProgress("2/3 Unpacking Microsoft VS Code...")
                           val assetList = context.assets.list("") ?: emptyArray()
                           val vscodeAsset = assetList.firstOrNull { it.startsWith("vscode-linux-arm64") }
                               ?: throw IOException("Pre-bundled vscode-linux-arm64 asset not found!")
@@ -415,10 +471,10 @@ jobs:
                               extractTarFromStream(input, vscodeDir, onProgress)
                           }
                       } else {
-                          onProgress("2/3 Official VS Code already installed.")
+                          onProgress("2/3 Microsoft VS Code ready.")
                       }
 
-                      onProgress("3/3 Configuring Environment...")
+                      onProgress("3/3 Finalizing Workbench...")
                       val p = prootManager.startProotCommand("bash /root/init-rootfs.sh", prootManager.homeDir.absolutePath, onLogLine = onProgress)
                       val exit = p.waitFor()
                       onProgress("Provisioning finished with code $exit")
@@ -485,7 +541,7 @@ jobs:
                               }
                           }
                           count++
-                          if (count % 3000 == 0) onProgress("Extracted $count files...")
+                          if (count % 3000 == 0) onProgress("Unpacking files...")
                           entry = tar.nextTarEntry
                       }
                   }
@@ -553,7 +609,7 @@ jobs:
           gh release create "$RELEASE_TAG" PocketVSCode-arm64.apk \
             --target "${{ github.sha }}" \
             --title "Pocket VS Code ($RELEASE_TAG)" \
-            --notes "Full performance build with new package ID com.pocket.vscode and official VS Code logo."
+            --notes "Zero-click direct auto-launch with official Fluent ribbon VS Code icon."
 
       - name: Upload Artifact Backup
         if: always()
