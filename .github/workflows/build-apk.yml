@@ -70,7 +70,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Lock applicationId to com.pocket.vscode while preserving Kotlin namespace
           find app -name "build.gradle.kts" -exec sed -i 's/applicationId = "[^"]*"/applicationId = "com.pocket.vscode"/g' {} + || true
           find app -name "build.gradle" -exec sed -i 's/applicationId "[^"]*"/applicationId "com.pocket.vscode"/g' {} + || true
 
@@ -125,12 +124,12 @@ jobs:
           cat > app/src/main/res/values/strings.xml << 'EOF'
           <resources>
               <string name="app_name">Pocket VS Code</string>
-              <color name="ic_launcher_background">#1E1E1E</color>
           </resources>
           EOF
 
           rm -rf app/src/main/res/mipmap-anydpi*
           rm -rf app/src/main/res/drawable*/ic_launcher*
+          rm -f app/src/main/res/values/ic_launcher_background.xml
 
           curl -fSL "https://raw.githubusercontent.com/microsoft/vscode/main/resources/linux/code.png" -o vscode_icon.png
 
@@ -144,7 +143,7 @@ jobs:
           os.makedirs(v26_dir, exist_ok=True)
           adaptive_xml = '''<?xml version="1.0" encoding="utf-8"?>
           <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-              <background android:drawable="@color/ic_launcher_background" />
+              <background android:drawable="@mipmap/ic_launcher_background" />
               <foreground android:drawable="@mipmap/ic_launcher_foreground" />
           </adaptive-icon>
           '''
@@ -165,7 +164,6 @@ jobs:
               dest_dir = os.path.join("app/src/main/res", folder)
               os.makedirs(dest_dir, exist_ok=True)
 
-              # Standard legacy icon with dark rounded pad
               bg_card = Image.new("RGBA", (legacy_size, legacy_size), (30, 30, 30, 255))
               pad = int(legacy_size * 0.78)
               icon_resized = img.resize((pad, pad), Image.Resampling.LANCZOS)
@@ -174,7 +172,9 @@ jobs:
               bg_card.save(os.path.join(dest_dir, "ic_launcher.png"))
               bg_card.save(os.path.join(dest_dir, "ic_launcher_round.png"))
 
-              # Adaptive foreground icon (66% safe zone)
+              bg_adaptive = Image.new("RGBA", (adaptive_size, adaptive_size), (30, 30, 30, 255))
+              bg_adaptive.save(os.path.join(dest_dir, "ic_launcher_background.png"))
+
               fg = Image.new("RGBA", (adaptive_size, adaptive_size), (0, 0, 0, 0))
               inner_size = int(adaptive_size * 0.64)
               inner_img = img.resize((inner_size, inner_size), Image.Resampling.LANCZOS)
@@ -242,71 +242,153 @@ jobs:
           EOF
           curl -fSL -H "User-Agent: Mozilla/5.0" "https://update.code.visualstudio.com/latest/linux-arm64/stable" -o app/src/main/assets/vscode-linux-arm64.tar.gz
 
-      - name: Configure StandaloneProvisioner with 0% to 100% Real-Time Progress
+      - name: Write StandaloneProvisioner with 0-100% Loading UI, Auto-Extract & Mode 2 Auto-Open
         run: |
           STANDALONE_PROV="app/src/main/java/com/vscode/desktop/standalone/StandaloneProvisioner.kt"
           mkdir -p "$(dirname "$STANDALONE_PROV")"
           cat > "$STANDALONE_PROV" << 'EOF'
           package com.vscode.desktop.standalone
 
+          import android.app.Activity
+          import android.app.AlertDialog
           import android.content.Context
+          import android.content.Intent
+          import android.graphics.Color
+          import android.net.Uri
+          import android.os.Handler
+          import android.os.Looper
+          import android.text.Editable
+          import android.text.TextWatcher
+          import android.view.View
+          import android.view.ViewGroup
+          import android.webkit.WebResourceError
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ProgressBar
+          import android.widget.TextView
           import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
           import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
           import org.apache.commons.compress.compressors.xz.XZCompressorInputStream
           import java.io.*
+          import java.net.InetSocketAddress
+          import java.net.Socket
           import java.nio.file.Files
           import java.nio.file.Paths
 
           class StandaloneProvisioner(private val context: Context, private val prootManager: ProotProcessManager) {
 
-              fun isProvisioned(): Boolean {
-                  return File(prootManager.rootfsDir, "bin/bash").exists() &&
-                         File(prootManager.rootfsDir, "opt/vscode-arm64/bin/code").exists()
+              private var progressDialog: AlertDialog? = null
+              private var progressBar: ProgressBar? = null
+              private var progressLabel: TextView? = null
+
+              private fun updateProgressUi(pct: Int, msg: String) {
+                  val act = context as? Activity ?: return
+                  act.runOnUiThread {
+                      try {
+                          if (progressDialog == null && !act.isFinishing) {
+                              val layout = LinearLayout(act).apply {
+                                  orientation = LinearLayout.VERTICAL
+                                  setPadding(64, 54, 64, 54)
+                                  setBackgroundColor(Color.parseColor("#1E1E1E"))
+                              }
+                              val title = TextView(act).apply {
+                                  text = "Setting up Pocket VS Code..."
+                                  textSize = 18f
+                                  setTextColor(Color.WHITE)
+                                  setPadding(0, 0, 0, 24)
+                              }
+                              val bar = ProgressBar(act, null, android.R.attr.progressBarStyleHorizontal).apply {
+                                  max = 100
+                                  progress = pct
+                                  minimumHeight = 28
+                              }
+                              val sub = TextView(act).apply {
+                                  text = "$pct% - $msg"
+                                  textSize = 14f
+                                  setTextColor(Color.parseColor("#0098FF"))
+                                  setPadding(0, 22, 0, 0)
+                              }
+                              layout.addView(title)
+                              layout.addView(bar)
+                              layout.addView(sub)
+                              progressBar = bar
+                              progressLabel = sub
+                              progressDialog = AlertDialog.Builder(act)
+                                  .setView(layout)
+                                  .setCancelable(false)
+                                  .create()
+                          }
+                          progressBar?.progress = pct
+                          progressLabel?.text = "$pct% - $msg"
+                          if (pct in 1..99) {
+                              if (progressDialog?.isShowing == false && !act.isFinishing) {
+                                  progressDialog?.show()
+                              }
+                          } else if (pct >= 100) {
+                              progressBar?.progress = 100
+                              progressLabel?.text = "100% - Setup Complete! Ready to Launch."
+                              Handler(Looper.getMainLooper()).postDelayed({
+                                  try { progressDialog?.dismiss() } catch (_: Exception) {}
+                              }, 900)
+                          }
+                      } catch (_: Exception) {}
+                  }
               }
 
               fun provisionAll(onProgress: (String) -> Unit): Boolean {
                   return try {
-                      onProgress("[PROGRESS:2] Preparing offline installation environment (2%)...")
+                      updateProgressUi(2, "Preparing offline installation...")
+                      onProgress("2% - Preparing offline installation...")
                       exportAssetScripts()
 
                       if (!File(prootManager.rootfsDir, "bin/bash").exists()) {
-                          onProgress("[PROGRESS:5] Step 1/3: Extracting Debian ARM64 Linux (5%)...")
+                          updateProgressUi(5, "Step 1/3: Extracting Debian ARM64 Linux...")
+                          onProgress("5% - Step 1/3: Extracting Bundled Debian Rootfs (Offline)...")
                           val assetList = context.assets.list("") ?: emptyArray()
                           val rootfsAsset = assetList.firstOrNull { it.startsWith("debian-rootfs.tar") }
                               ?: throw IOException("Pre-bundled debian-rootfs asset not found!")
                           context.assets.open(rootfsAsset).use { input ->
-                              extractTarFromStream(input, prootManager.rootfsDir, 5, 45, 6500, "Debian Linux", onProgress)
+                              extractTarFromStream(input, prootManager.rootfsDir, 5, 48, 6500, "Debian Linux", onProgress)
                           }
                       } else {
-                          onProgress("[PROGRESS:45] Step 1/3: Debian Rootfs already extracted (45%).")
+                          updateProgressUi(48, "Step 1/3: Debian Rootfs already installed.")
+                          onProgress("48% - Step 1/3: Debian Rootfs already installed.")
                       }
 
                       val vscodeDir = File(prootManager.rootfsDir, "opt/vscode-arm64")
                       if (!File(vscodeDir, "bin/code").exists()) {
                           vscodeDir.mkdirs()
-                          onProgress("[PROGRESS:48] Step 2/3: Extracting Official Microsoft VS Code (48%)...")
+                          updateProgressUi(50, "Step 2/3: Extracting Official Microsoft VS Code...")
+                          onProgress("50% - Step 2/3: Extracting Bundled Microsoft VS Code (Offline)...")
                           val assetList = context.assets.list("") ?: emptyArray()
                           val vscodeAsset = assetList.firstOrNull { it.startsWith("vscode-linux-arm64") }
                               ?: throw IOException("Pre-bundled vscode-linux-arm64 asset not found!")
                           context.assets.open(vscodeAsset).use { input ->
-                              extractTarFromStream(input, vscodeDir, 48, 88, 4500, "VS Code", onProgress)
+                              extractTarFromStream(input, vscodeDir, 50, 90, 4500, "VS Code", onProgress)
                           }
                       } else {
-                          onProgress("[PROGRESS:88] Step 2/3: Official VS Code already extracted (88%).")
+                          updateProgressUi(90, "Step 2/3: Official VS Code already installed.")
+                          onProgress("90% - Step 2/3: Official VS Code already installed.")
                       }
 
-                      onProgress("[PROGRESS:92] Step 3/3: Configuring Linux permissions & user profile (92%)...")
-                      val p = prootManager.startProotCommand("bash /root/init-rootfs.sh", prootManager.homeDir.absolutePath, onLogLine = { line ->
-                          onProgress("[PROGRESS:96] $line")
-                      })
+                      updateProgressUi(94, "Step 3/3: Finalizing Linux environment...")
+                      onProgress("94% - Step 3/3: Configuring Environment...")
+                      val p = prootManager.startProotCommand("bash /root/init-rootfs.sh", prootManager.homeDir.absolutePath, onLogLine = onProgress)
                       val exit = p.waitFor()
                       if (exit == 0) {
-                          onProgress("[PROGRESS:100] Installation 100% Complete! Ready to Launch.")
+                          updateProgressUi(100, "Installation 100% Complete!")
+                          onProgress("100% - Provisioning finished successfully!")
                       } else {
+                          updateProgressUi(100, "Finished with code $exit")
                           onProgress("Provisioning finished with code $exit")
                       }
                       exit == 0
                   } catch (e: Exception) {
+                      updateProgressUi(100, "Error: ${e.message}")
                       onProgress("ERROR during provisioning: ${e.message}")
                       false
                   }
@@ -328,7 +410,7 @@ jobs:
                   destDir: File,
                   startPct: Int,
                   endPct: Int,
-                  estimatedTotal: Int,
+                  estTotal: Int,
                   label: String,
                   onProgress: (String) -> Unit
               ) {
@@ -376,24 +458,166 @@ jobs:
                               }
                           }
                           count++
-                          if (count % 400 == 0) {
+                          if (count % 350 == 0) {
                               val span = endPct - startPct
-                              val pct = (startPct + (count * span / estimatedTotal)).coerceIn(startPct, endPct)
-                              onProgress("[PROGRESS:$pct] Extracting $label ($pct%) - $count files unpacked...")
+                              val pct = (startPct + (count * span / estTotal)).coerceIn(startPct, endPct)
+                              updateProgressUi(pct, "Extracting $label ($count files)...")
+                              onProgress("$pct% - Extracting $label ($count files)...")
                           }
                           entry = tar.nextTarEntry
+                      }
+                  }
+              }
+
+              companion object {
+                  @Volatile private var autoExtractTriggered = false
+                  @Volatile private var mode2LaunchTriggered = false
+
+                  private fun collectViews(root: View, out: MutableList<View>) {
+                      out.add(root)
+                      if (root is ViewGroup) {
+                          for (i in 0 until root.childCount) {
+                              collectViews(root.getChildAt(i), out)
+                          }
+                      }
+                  }
+
+                  fun attachMainActivity(activity: Activity) {
+                      activity.window.decorView.post {
+                          try {
+                              val allViews = mutableListOf<View>()
+                              collectViews(activity.window.decorView.rootView, allViews)
+
+                              val installBtn = allViews.filterIsInstance<Button>().firstOrNull {
+                                  it.text.toString().contains("2.", ignoreCase = true) ||
+                                  it.text.toString().contains("INSTALL", ignoreCase = true)
+                              }
+
+                              val rootfsReady = File(activity.filesDir, "rootfs/opt/vscode-arm64/bin/code").exists()
+                              var initialFolderText: String? = null
+
+                              allViews.filterIsInstance<EditText>().firstOrNull()?.let { edit ->
+                                  initialFolderText = edit.text.toString()
+                                  edit.addTextChangedListener(object : TextWatcher {
+                                      override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                                      override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                                      override fun afterTextChanged(s: Editable?) {
+                                          val cur = s?.toString() ?: ""
+                                          if (cur.isNotEmpty() && cur != initialFolderText && !autoExtractTriggered) {
+                                              val installedNow = File(activity.filesDir, "rootfs/opt/vscode-arm64/bin/code").exists()
+                                              if (!installedNow && !rootfsReady) {
+                                                  autoExtractTriggered = true
+                                                  Handler(Looper.getMainLooper()).postDelayed({
+                                                      installBtn?.performClick()
+                                                  }, 300)
+                                              }
+                                          }
+                                      }
+                                  })
+                              }
+
+                              allViews.filterIsInstance<TextView>().filter { it !is Button && it !is EditText }.forEach { tv ->
+                                  tv.addTextChangedListener(object : TextWatcher {
+                                      override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                                      override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                                      override fun afterTextChanged(s: Editable?) {
+                                          val logs = s?.toString() ?: ""
+                                          if (logs.contains("Selected Android Project Folder:") && !autoExtractTriggered) {
+                                              val installedNow = File(activity.filesDir, "rootfs/opt/vscode-arm64/bin/code").exists()
+                                              if (!installedNow) {
+                                                  autoExtractTriggered = true
+                                                  Handler(Looper.getMainLooper()).postDelayed({
+                                                      installBtn?.performClick()
+                                                  }, 300)
+                                              }
+                                          }
+                                          if ((logs.contains("mode: direct") || logs.contains("code serve-web") || logs.contains("Resuming active Mode 2")) && !mode2LaunchTriggered) {
+                                              mode2LaunchTriggered = true
+                                              Thread {
+                                                  var open = false
+                                                  for (attempt in 1..40) {
+                                                      try {
+                                                          Socket().use { sock ->
+                                                              sock.connect(InetSocketAddress("127.0.0.1", 8080), 400)
+                                                              open = true
+                                                          }
+                                                          if (open) break
+                                                      } catch (_: Exception) {}
+                                                      Thread.sleep(500)
+                                                  }
+                                                  if (open) {
+                                                      activity.runOnUiThread {
+                                                          try {
+                                                              val intent = Intent(activity, WorkbenchActivity::class.java).apply {
+                                                                  putExtra("mode", "direct")
+                                                                  putExtra("url", "http://127.0.0.1:8080/?folder=/root/Workspace")
+                                                              }
+                                                              activity.startActivity(intent)
+                                                          } catch (_: Exception) {
+                                                              try {
+                                                                  activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("http://127.0.0.1:8080/?folder=/root/Workspace")))
+                                                              } catch (_: Exception) {}
+                                                          }
+                                                      }
+                                                  }
+                                                  Thread.sleep(5000)
+                                                  mode2LaunchTriggered = false
+                                              }.start()
+                                          }
+                                      }
+                                  })
+                              }
+                          } catch (_: Exception) {}
+                      }
+                  }
+
+                  fun attachWorkbenchActivity(activity: Activity) {
+                      activity.window.decorView.post {
+                          try {
+                              val allViews = mutableListOf<View>()
+                              collectViews(activity.window.decorView.rootView, allViews)
+                              val webView = allViews.filterIsInstance<WebView>().firstOrNull() ?: return@post
+
+                              webView.settings.javaScriptEnabled = true
+                              webView.settings.domStorageEnabled = true
+                              webView.settings.databaseEnabled = true
+
+                              webView.webViewClient = object : WebViewClient() {
+                                  override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean = false
+                                  @Deprecated("Deprecated in Java")
+                                  override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean = false
+                                  override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                                      if (request?.isForMainFrame == true) {
+                                          view?.postDelayed({ view.reload() }, 1000)
+                                      }
+                                  }
+                              }
+
+                              val mode = activity.intent?.getStringExtra("mode") ?: ""
+                              val targetUrl = activity.intent?.getStringExtra("url") ?: ""
+                              if (mode == "direct" || targetUrl.contains("8080")) {
+                                  webView.loadUrl("http://127.0.0.1:8080/?folder=/root/Workspace")
+                              }
+
+                              activity.window.decorView.viewTreeObserver.addOnWindowFocusChangeListener { hasFocus ->
+                                  if (!hasFocus) {
+                                      try {
+                                          webView.evaluateJavascript("window.dispatchEvent(new Event('blur')); document.dispatchEvent(new Event('visibilitychange'));", null)
+                                      } catch (_: Exception) {}
+                                  }
+                              }
+                          } catch (_: Exception) {}
                       }
                   }
               }
           }
           EOF
 
-      - name: Patch Launch Script, Auto-Extraction UI, & Mode 2 Auto-Open + 0.5s Auto-Save
+      - name: Patch Launch Script & Hook Activities Safely
         run: |
           python3 - << 'EOF'
           import os, re
 
-          # 1. Patch start-vscode-session.sh for Mode 2 (0.5s Auto-Save, Session Restore, 10m Idle Hibernate) & Mode 1 (High Perf Non-Root UI)
           script_path = "app/src/main/assets/start-vscode-session.sh"
           with open(script_path, "r", encoding="utf-8") as f:
               orig = f.read()
@@ -421,7 +645,6 @@ jobs:
               sed -i 's|/proc/version|/dev/null|g' /opt/vscode-arm64/bin/code || true
           fi
 
-          # Mode 2 Specific 0.5s Auto-Save, Hot-Exit Session Persistence, and Battery Optimization
           for S_PATH in "/root/.vscode-server-data/data/Machine/settings.json" "/root/.vscode-server-data/data/User/settings.json"; do
               cat > "$S_PATH" << 'JSONEOF'
           {
@@ -445,7 +668,6 @@ jobs:
           JSONEOF
           done
 
-          # Mode 2 Smart Wrapper: Auto-resumes existing session & hibernates after 10 mins of closed browser/webview
           cat > /usr/local/bin/code-serve-web-smart << 'WRAPEOF'
           #!/bin/bash
           start_mode2_idle_watcher() {
@@ -486,7 +708,6 @@ jobs:
           WRAPEOF
           chmod 755 /usr/local/bin/code-serve-web-smart
 
-          # Mode 1 Non-Root UI Patch (Removes [Superuser] and root warning)
           if [ ! -f /opt/vscode-arm64/.noroot_patched ] && [ -d /opt/vscode-arm64/resources/app/out ]; then
               find /opt/vscode-arm64/resources/app/out -name "preload*.js" -exec sed -i 's/process\.getuid()/1000/g' {} + || true
               WB_JS="/opt/vscode-arm64/resources/app/out/vs/workbench/workbench.desktop.main.js"
@@ -508,7 +729,7 @@ jobs:
           """
 
           if orig.startswith("#!/"):
-              orig = re.sub(r'^#!/[^\n]*\n', header_patch + "\n", orig, count=1)
+              orig = re.sub(r'^#!/[^\n]*\n', lambda m: header_patch + "\n", orig, count=1)
           else:
               orig = header_patch + "\n" + orig
 
@@ -516,7 +737,6 @@ jobs:
               f.write(orig)
           os.chmod(script_path, 0o755)
 
-          # 2. Patch ProotProcessManager, MainActivity, and WorkbenchActivity
           for root, _, files in os.walk("app/src/main/java"):
               for fn in files:
                   p = os.path.join(root, fn)
@@ -536,7 +756,7 @@ jobs:
                       if "start-vscode-session.sh" not in code:
                           code = re.sub(
                               r'(fun\s+startProotCommand\s*\([^)]*\)\s*:\s*Process\s*\{)',
-                              r'\1\n' + sync_snippet,
+                              lambda m: m.group(1) + "\n" + sync_snippet,
                               code,
                               count=1
                           )
@@ -546,161 +766,24 @@ jobs:
                   if fn == "MainActivity.kt":
                       with open(p, "r", encoding="utf-8") as f:
                           code = f.read()
-
-                      # Inject Progress Dialog / 0-100% Loading Screen & Auto-Extraction + Mode 2 Auto-Open Helper into MainActivity
-                      helper_methods = """
-                      private var progressDialog: android.app.AlertDialog? = null
-                      private var progressBarView: android.widget.ProgressBar? = null
-                      private var progressTextView: android.widget.TextView? = null
-                      private var autoInstallRunning = false
-                      private var mode2AutoOpened = false
-
-                      private fun updateLoadingScreen(pct: Int, message: String) {
-                          runOnUiThread {
-                              if (progressDialog == null) {
-                                  val container = android.widget.LinearLayout(this).apply {
-                                      orientation = android.widget.LinearLayout.VERTICAL
-                                      setPadding(60, 50, 60, 50)
-                                      setBackgroundColor(android.graphics.Color.parseColor("#1E1E1E"))
-                                  }
-                                  val title = android.widget.TextView(this).apply {
-                                      text = "Setting up Pocket VS Code..."
-                                      textSize = 18f
-                                      setTextColor(android.graphics.Color.WHITE)
-                                      setPadding(0, 0, 0, 24)
-                                  }
-                                  progressBarView = android.widget.ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-                                      max = 100
-                                      progress = pct
-                                      minimumHeight = 24
-                                  }
-                                  progressTextView = android.widget.TextView(this).apply {
-                                      text = "$pct% - $message"
-                                      textSize = 14f
-                                      setTextColor(android.graphics.Color.parseColor("#0098FF"))
-                                      setPadding(0, 20, 0, 0)
-                                  }
-                                  container.addView(title)
-                                  container.addView(progressBarView)
-                                  container.addView(progressTextView)
-                                  progressDialog = android.app.AlertDialog.Builder(this)
-                                      .setView(container)
-                                      .setCancelable(false)
-                                      .create()
-                              }
-                              progressBarView?.progress = pct
-                              progressTextView?.text = message
-                              if (pct in 1..99) {
-                                  if (progressDialog?.isShowing == false) progressDialog?.show()
-                              } else if (pct >= 100) {
-                                  progressBarView?.progress = 100
-                                  progressTextView?.text = "100% - Setup Complete!"
-                                  android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                                      try { progressDialog?.dismiss() } catch (_: Exception) {}
-                                  }, 800)
-                              }
-                          }
-                      }
-
-                      private fun checkAutoTriggerExtractionAndLog(msg: String) {
-                          val regex = Regex("\\\\[PROGRESS:(\\\\d+)\\\\]\\\\s*(.*)")
-                          val match = regex.find(msg)
-                          if (match != null) {
-                              val pct = match.groupValues[1].toIntOrNull() ?: 0
-                              val cleanMsg = match.groupValues[2]
-                              updateLoadingScreen(pct, cleanMsg)
-                          }
-                          if (msg.contains("Selected Android Project Folder") && !autoInstallRunning) {
-                              val prov = StandaloneProvisioner(this, prootManager)
-                              if (!prov.isProvisioned()) {
-                                  autoInstallRunning = true
-                                  updateLoadingScreen(1, "Starting automatic background extraction (1%)...")
-                                  Thread {
-                                      prov.provisionAll { line ->
-                                          checkAutoTriggerExtractionAndLog(line)
-                                      }
-                                      autoInstallRunning = false
-                                  }.start()
-                              }
-                          }
-                          if ((msg.contains("Web UI available at") || msg.contains("127.0.0.1:8080") || msg.contains("Resuming active Mode 2")) && !mode2AutoOpened) {
-                              mode2AutoOpened = true
-                              runOnUiThread {
-                                  android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                                      try {
-                                          val intent = android.content.Intent(this, WorkbenchActivity::class.java).apply {
-                                              putExtra("mode", "direct")
-                                              putExtra("url", "http://127.0.0.1:8080/?folder=/root/Workspace")
-                                          }
-                                          startActivity(intent)
-                                      } catch (e: Exception) {
-                                          try {
-                                              startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("http://127.0.0.1:8080/?folder=/root/Workspace")))
-                                          } catch (_: Exception) {}
-                                      }
-                                      android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({ mode2AutoOpened = false }, 5000)
-                                  }, 600)
-                              }
-                          }
-                      }
-                      """
-
-                      if "checkAutoTriggerExtractionAndLog" not in code:
-                          # Hook into any log appending method in MainActivity
-                          code = re.sub(
-                              r'(fun\s+appendLog\s*\(\s*(\w+)\s*:\s*String\s*\)\s*\{)',
-                              r'\1\n        checkAutoTriggerExtractionAndLog(\2)',
-                              code
+                      if "StandaloneProvisioner.attachMainActivity(this)" not in code:
+                          code = code.replace(
+                              "super.onCreate(savedInstanceState)",
+                              "super.onCreate(savedInstanceState)\n        StandaloneProvisioner.attachMainActivity(this)"
                           )
-                          code = re.sub(r'(\}\s*)$', helper_methods + "\n}", code, count=1)
-
-                      with open(p, "w", encoding="utf-8") as f:
-                          f.write(code)
+                          with open(p, "w", encoding="utf-8") as f:
+                              f.write(code)
 
                   if fn == "WorkbenchActivity.kt":
                       with open(p, "r", encoding="utf-8") as f:
                           code = f.read()
-
                       code = code.replace('"http://127.0.0.1:8080"', '"http://127.0.0.1:8080/?folder=/root/Workspace"')
                       code = code.replace('"http://127.0.0.1:8080/"', '"http://127.0.0.1:8080/?folder=/root/Workspace"')
-
-                      if ".loadUrl(" in code and "shouldOverrideUrlLoading" not in code:
-                          wv_chain = """.apply {
-                              settings.javaScriptEnabled = true
-                              settings.domStorageEnabled = true
-                              settings.databaseEnabled = true
-                              webViewClient = object : android.webkit.WebViewClient() {
-                                  override fun shouldOverrideUrlLoading(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): Boolean = false
-                                  @Deprecated("Deprecated in Java")
-                                  override fun shouldOverrideUrlLoading(view: android.webkit.WebView?, url: String?): Boolean = false
-                                  override fun onReceivedError(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?, error: android.webkit.WebResourceError?) {
-                                      if (request?.isForMainFrame == true) {
-                                          view?.postDelayed({ view.reload() }, 1000)
-                                      }
-                                  }
-                              }
-                          }.loadUrl("""
-                          code = code.replace(".loadUrl(", wv_chain)
-
-                      if "override fun onPause()" not in code:
-                          lifecycle_patch = """
-                          override fun onPause() {
-                              try {
-                                  webView.evaluateJavascript("window.dispatchEvent(new Event('blur')); document.dispatchEvent(new Event('visibilitychange'));", null)
-                                  webView.onPause()
-                              } catch (_: Exception) {}
-                              super.onPause()
-                          }
-
-                          override fun onResume() {
-                              super.onResume()
-                              try {
-                                  webView.onResume()
-                              } catch (_: Exception) {}
-                          }
-                          """
-                          code = re.sub(r'(\}\s*)$', lifecycle_patch + "\n}", code, count=1)
-
+                      if "StandaloneProvisioner.attachWorkbenchActivity(this)" not in code:
+                          code = code.replace(
+                              "super.onCreate(savedInstanceState)",
+                              "super.onCreate(savedInstanceState)\n        StandaloneProvisioner.attachWorkbenchActivity(this)"
+                          )
                       with open(p, "w", encoding="utf-8") as f:
                           f.write(code)
           EOF
@@ -765,7 +848,7 @@ jobs:
           gh release create "$RELEASE_TAG" PocketVSCode-arm64.apk pocket-vscode-permanent.keystore \
             --target "${{ github.sha }}" \
             --title "Pocket VS Code ($RELEASE_TAG)" \
-            --notes "Added official VS Code icon, 0-100% auto-extraction loading screen on folder select, Mode 2 auto-open, and 0.5s auto-save."
+            --notes "Fixed Gradle compile, official VS Code icon, 0-100% auto-extraction loading bar, and Mode 2 auto-open + 0.5s auto-save."
 
       - name: Upload Artifact Backup
         if: always()
