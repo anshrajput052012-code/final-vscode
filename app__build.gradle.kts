@@ -4,15 +4,20 @@ plugins {
 }
 
 android {
+    // Kotlin source package (unchanged). Yeh applicationId se alag cheez hai.
     namespace = "com.vscode.desktop.standalone"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.vscode.desktop.standalone"
+        // PERMANENT package ID — kabhi change mat karna, warna update "App not installed" dega.
+        applicationId = "com.pocket.vscode"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0-standalone"
+
+        // GitHub Actions mein har run ka number auto-increment hota hai => naya APK hamesha
+        // purane ke upar update ho jata hai. Local build mein 1 use hota hai.
+        versionCode = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
+        versionName = "1.0.${System.getenv("GITHUB_RUN_NUMBER") ?: "0"}"
 
         ndk {
             abiFilters.add("arm64-v8a")
@@ -21,11 +26,16 @@ android {
 
     packaging {
         jniLibs {
-            // CRITICAL for Android 10+ (API 29+):
-            // Extracts libproot.so, libproot-loader.so, and libtalloc.so.2 into
-            // nativeLibraryDir (/data/app/.../lib/arm64/) which has SELinux exec permissions.
+            // Android 10+ par libproot.so ko nativeLibraryDir (exec-allowed) mein extract karne ke liye.
             useLegacyPackaging = true
         }
+    }
+
+    // Bundled rootfs / VS Code archives pehle se compressed hain. Dobara compress na karein:
+    // build tez hota hai aur assets seedhe openFd() se (length ke saath) padhe ja sakte hain,
+    // jisse extraction ka real 0-100% progress milta hai.
+    androidResources {
+        noCompress += listOf("xz", "gz")
     }
 
     buildTypes {

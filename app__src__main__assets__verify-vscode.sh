@@ -13,7 +13,7 @@ else
     echo "PASS: All ELF shared libraries resolved."
 fi
 
-echo "=== [3/6] Native Modules Check (node-pty, ripgrep, spdlog) ==="
+echo "=== [3/6] Native Modules Check (ripgrep) ==="
 RG_BIN=$(find /opt/vscode-arm64 -name "rg" -type f | head -n 1)
 "$RG_BIN" --version
 
@@ -31,9 +31,9 @@ git config user.email "dev@android.local"
 git config user.name "Android Dev"
 echo "print('Genuine VS Code on Android without Termux!')" > app.py
 python3 app.py
-git add app.py && git commit -m "Verified Git inside standalone APK"
+git add app.py && git commit -q -m "Verified Git inside standalone APK"
 
-echo "=== [6/6] Official Marketplace Extension Install Check ==="
+echo "=== [6/6] Official Marketplace Extension Install Check (internet chahiye) ==="
 /opt/vscode-arm64/bin/code \
     --no-sandbox \
     --user-data-dir=/root/.config/Code \

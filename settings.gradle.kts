@@ -12,5 +12,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "VSCodeAndroidStandalone"
+rootProject.name = "PocketVSCode"
 include(":app")
