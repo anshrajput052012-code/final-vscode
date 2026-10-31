@@ -48,7 +48,7 @@ jobs:
                   mavenCentral()
               }
           }
-          rootProject.name = "PocketVSCode"
+          rootProject.name = "VSCodeAndroidStandalone"
           include(":app")
           EOF
 
@@ -115,7 +115,7 @@ jobs:
           find app -name "build.gradle.kts" -exec sed -i 's/versionCode = [0-9]*/versionCode = ${{ github.run_number }}/g' {} + || true
           find app -name "build.gradle" -exec sed -i 's/versionCode [0-9]*/versionCode ${{ github.run_number }}/g' {} + || true
 
-      - name: Generate Official Pocket VS Code Adaptive & Legacy Icons
+      - name: Set App Name and Generate Official VS Code Icons
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y python3-pil curl
@@ -127,60 +127,45 @@ jobs:
           </resources>
           EOF
 
+          # Remove adaptive XMLs so Android uses high-res VS Code PNG mipmaps directly without AAPT2 conflicts
           rm -rf app/src/main/res/mipmap-anydpi*
           rm -rf app/src/main/res/drawable*/ic_launcher*
-          rm -f app/src/main/res/values/ic_launcher_background.xml
 
           curl -fSL "https://raw.githubusercontent.com/microsoft/vscode/main/resources/linux/code.png" -o vscode_icon.png
 
           python3 - << 'EOF'
           import os, re
-          from PIL import Image
+          from PIL import Image, ImageDraw
 
           img = Image.open("vscode_icon.png").convert("RGBA")
 
-          v26_dir = "app/src/main/res/mipmap-anydpi-v26"
-          os.makedirs(v26_dir, exist_ok=True)
-          adaptive_xml = '''<?xml version="1.0" encoding="utf-8"?>
-          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-              <background android:drawable="@mipmap/ic_launcher_background" />
-              <foreground android:drawable="@mipmap/ic_launcher_foreground" />
-          </adaptive-icon>
-          '''
-          with open(os.path.join(v26_dir, "ic_launcher.xml"), "w") as f:
-              f.write(adaptive_xml)
-          with open(os.path.join(v26_dir, "ic_launcher_round.xml"), "w") as f:
-              f.write(adaptive_xml)
-
-          densities = {
-              "mipmap-mdpi": (48, 108),
-              "mipmap-hdpi": (72, 162),
-              "mipmap-xhdpi": (96, 216),
-              "mipmap-xxhdpi": (144, 324),
-              "mipmap-xxxhdpi": (192, 432)
+          sizes = {
+              "mipmap-mdpi": 48,
+              "mipmap-hdpi": 72,
+              "mipmap-xhdpi": 96,
+              "mipmap-xxhdpi": 144,
+              "mipmap-xxxhdpi": 192
           }
 
-          for folder, (legacy_size, adaptive_size) in densities.items():
+          for folder, size in sizes.items():
               dest_dir = os.path.join("app/src/main/res", folder)
               os.makedirs(dest_dir, exist_ok=True)
 
-              bg_card = Image.new("RGBA", (legacy_size, legacy_size), (30, 30, 30, 255))
-              pad = int(legacy_size * 0.78)
-              icon_resized = img.resize((pad, pad), Image.Resampling.LANCZOS)
-              off = (legacy_size - pad) // 2
-              bg_card.paste(icon_resized, (off, off), icon_resized)
-              bg_card.save(os.path.join(dest_dir, "ic_launcher.png"))
-              bg_card.save(os.path.join(dest_dir, "ic_launcher_round.png"))
+              # Dark background card with centered official blue VS Code icon
+              card = Image.new("RGBA", (size, size), (30, 30, 30, 255))
+              inner = int(size * 0.76)
+              logo = img.resize((inner, inner), Image.Resampling.LANCZOS)
+              off = (size - inner) // 2
+              card.paste(logo, (off, off), logo)
+              card.save(os.path.join(dest_dir, "ic_launcher.png"))
 
-              bg_adaptive = Image.new("RGBA", (adaptive_size, adaptive_size), (30, 30, 30, 255))
-              bg_adaptive.save(os.path.join(dest_dir, "ic_launcher_background.png"))
-
-              fg = Image.new("RGBA", (adaptive_size, adaptive_size), (0, 0, 0, 0))
-              inner_size = int(adaptive_size * 0.64)
-              inner_img = img.resize((inner_size, inner_size), Image.Resampling.LANCZOS)
-              offset = (adaptive_size - inner_size) // 2
-              fg.paste(inner_img, (offset, offset), inner_img)
-              fg.save(os.path.join(dest_dir, "ic_launcher_foreground.png"))
+              # Circular mask for roundIcon
+              mask = Image.new("L", (size, size), 0)
+              draw = ImageDraw.Draw(mask)
+              draw.ellipse((0, 0, size - 1, size - 1), fill=255)
+              round_card = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+              round_card.paste(card, (0, 0), mask)
+              round_card.save(os.path.join(dest_dir, "ic_launcher_round.png"))
 
           for root, _, files in os.walk("app/src/main"):
               for file in files:
@@ -242,7 +227,7 @@ jobs:
           EOF
           curl -fSL -H "User-Agent: Mozilla/5.0" "https://update.code.visualstudio.com/latest/linux-arm64/stable" -o app/src/main/assets/vscode-linux-arm64.tar.gz
 
-      - name: Write StandaloneProvisioner with 0-100% Loading UI, Auto-Extract & Mode 2 Auto-Open
+      - name: Write Compile-Safe StandaloneProvisioner (0-100% Loading UI + Auto-Extract + Mode 2 Auto-Open)
         run: |
           STANDALONE_PROV="app/src/main/java/com/vscode/desktop/standalone/StandaloneProvisioner.kt"
           mkdir -p "$(dirname "$STANDALONE_PROV")"
@@ -292,7 +277,7 @@ jobs:
                           if (progressDialog == null && !act.isFinishing) {
                               val layout = LinearLayout(act).apply {
                                   orientation = LinearLayout.VERTICAL
-                                  setPadding(64, 54, 64, 54)
+                                  setPadding(60, 50, 60, 50)
                                   setBackgroundColor(Color.parseColor("#1E1E1E"))
                               }
                               val title = TextView(act).apply {
@@ -304,13 +289,12 @@ jobs:
                               val bar = ProgressBar(act, null, android.R.attr.progressBarStyleHorizontal).apply {
                                   max = 100
                                   progress = pct
-                                  minimumHeight = 28
                               }
                               val sub = TextView(act).apply {
                                   text = "$pct% - $msg"
                                   textSize = 14f
                                   setTextColor(Color.parseColor("#0098FF"))
-                                  setPadding(0, 22, 0, 0)
+                                  setPadding(0, 20, 0, 0)
                               }
                               layout.addView(title)
                               layout.addView(bar)
@@ -333,7 +317,7 @@ jobs:
                               progressLabel?.text = "100% - Setup Complete! Ready to Launch."
                               Handler(Looper.getMainLooper()).postDelayed({
                                   try { progressDialog?.dismiss() } catch (_: Exception) {}
-                              }, 900)
+                              }, 800)
                           }
                       } catch (_: Exception) {}
                   }
@@ -375,7 +359,7 @@ jobs:
                           onProgress("90% - Step 2/3: Official VS Code already installed.")
                       }
 
-                      updateProgressUi(94, "Step 3/3: Finalizing Linux environment...")
+                      updateProgressUi(94, "Step 3/3: Configuring Linux environment...")
                       onProgress("94% - Step 3/3: Configuring Environment...")
                       val p = prootManager.startProotCommand("bash /root/init-rootfs.sh", prootManager.homeDir.absolutePath, onLogLine = onProgress)
                       val exit = p.waitFor()
@@ -482,20 +466,77 @@ jobs:
                       }
                   }
 
-                  fun attachMainActivity(activity: Activity) {
+                  private fun openMode2Url(activity: Activity) {
+                      val targetUrl = "http://127.0.0.1:8080/?folder=/root/Workspace"
+                      try {
+                          val allViews = mutableListOf<View>()
+                          collectViews(activity.window.decorView.rootView, allViews)
+                          val inAppWebView = allViews.filterIsInstance<WebView>().firstOrNull()
+                          if (inAppWebView != null) {
+                              inAppWebView.visibility = View.VISIBLE
+                              (inAppWebView.parent as? View)?.visibility = View.VISIBLE
+                              inAppWebView.settings.javaScriptEnabled = true
+                              inAppWebView.settings.domStorageEnabled = true
+                              inAppWebView.settings.databaseEnabled = true
+                              inAppWebView.webViewClient = object : WebViewClient() {
+                                  override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean = false
+                                  @Deprecated("Deprecated in Java")
+                                  override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean = false
+                              }
+                              inAppWebView.loadUrl(targetUrl)
+                              return
+                          }
+                      } catch (_: Exception) {}
+
+                      try {
+                          val wbClass = Class.forName("com.vscode.desktop.standalone.WorkbenchActivity")
+                          val intent = Intent(activity, wbClass).apply {
+                              putExtra("mode", "direct")
+                              putExtra("url", targetUrl)
+                          }
+                          activity.startActivity(intent)
+                          return
+                      } catch (_: Throwable) {}
+
+                      try {
+                          activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(targetUrl)))
+                      } catch (_: Exception) {}
+                  }
+
+                  fun attachActivity(activity: Activity) {
                       activity.window.decorView.post {
                           try {
                               val allViews = mutableListOf<View>()
                               collectViews(activity.window.decorView.rootView, allViews)
+
+                              // Configure any WebView present in this Activity
+                              allViews.filterIsInstance<WebView>().forEach { webView ->
+                                  webView.settings.javaScriptEnabled = true
+                                  webView.settings.domStorageEnabled = true
+                                  webView.settings.databaseEnabled = true
+                                  webView.webViewClient = object : WebViewClient() {
+                                      override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean = false
+                                      @Deprecated("Deprecated in Java")
+                                      override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean = false
+                                      override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                                          if (request?.isForMainFrame == true) {
+                                              view?.postDelayed({ view.reload() }, 1000)
+                                          }
+                                      }
+                                  }
+                                  val mode = activity.intent?.getStringExtra("mode") ?: ""
+                                  val u = activity.intent?.getStringExtra("url") ?: ""
+                                  if (mode == "direct" || u.contains("8080")) {
+                                      webView.loadUrl("http://127.0.0.1:8080/?folder=/root/Workspace")
+                                  }
+                              }
 
                               val installBtn = allViews.filterIsInstance<Button>().firstOrNull {
                                   it.text.toString().contains("2.", ignoreCase = true) ||
                                   it.text.toString().contains("INSTALL", ignoreCase = true)
                               }
 
-                              val rootfsReady = File(activity.filesDir, "rootfs/opt/vscode-arm64/bin/code").exists()
                               var initialFolderText: String? = null
-
                               allViews.filterIsInstance<EditText>().firstOrNull()?.let { edit ->
                                   initialFolderText = edit.text.toString()
                                   edit.addTextChangedListener(object : TextWatcher {
@@ -505,7 +546,7 @@ jobs:
                                           val cur = s?.toString() ?: ""
                                           if (cur.isNotEmpty() && cur != initialFolderText && !autoExtractTriggered) {
                                               val installedNow = File(activity.filesDir, "rootfs/opt/vscode-arm64/bin/code").exists()
-                                              if (!installedNow && !rootfsReady) {
+                                              if (!installedNow) {
                                                   autoExtractTriggered = true
                                                   Handler(Looper.getMainLooper()).postDelayed({
                                                       installBtn?.performClick()
@@ -547,17 +588,7 @@ jobs:
                                                   }
                                                   if (open) {
                                                       activity.runOnUiThread {
-                                                          try {
-                                                              val intent = Intent(activity, WorkbenchActivity::class.java).apply {
-                                                                  putExtra("mode", "direct")
-                                                                  putExtra("url", "http://127.0.0.1:8080/?folder=/root/Workspace")
-                                                              }
-                                                              activity.startActivity(intent)
-                                                          } catch (_: Exception) {
-                                                              try {
-                                                                  activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("http://127.0.0.1:8080/?folder=/root/Workspace")))
-                                                              } catch (_: Exception) {}
-                                                          }
+                                                          openMode2Url(activity)
                                                       }
                                                   }
                                                   Thread.sleep(5000)
@@ -570,50 +601,11 @@ jobs:
                           } catch (_: Exception) {}
                       }
                   }
-
-                  fun attachWorkbenchActivity(activity: Activity) {
-                      activity.window.decorView.post {
-                          try {
-                              val allViews = mutableListOf<View>()
-                              collectViews(activity.window.decorView.rootView, allViews)
-                              val webView = allViews.filterIsInstance<WebView>().firstOrNull() ?: return@post
-
-                              webView.settings.javaScriptEnabled = true
-                              webView.settings.domStorageEnabled = true
-                              webView.settings.databaseEnabled = true
-
-                              webView.webViewClient = object : WebViewClient() {
-                                  override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean = false
-                                  @Deprecated("Deprecated in Java")
-                                  override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean = false
-                                  override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
-                                      if (request?.isForMainFrame == true) {
-                                          view?.postDelayed({ view.reload() }, 1000)
-                                      }
-                                  }
-                              }
-
-                              val mode = activity.intent?.getStringExtra("mode") ?: ""
-                              val targetUrl = activity.intent?.getStringExtra("url") ?: ""
-                              if (mode == "direct" || targetUrl.contains("8080")) {
-                                  webView.loadUrl("http://127.0.0.1:8080/?folder=/root/Workspace")
-                              }
-
-                              activity.window.decorView.viewTreeObserver.addOnWindowFocusChangeListener { hasFocus ->
-                                  if (!hasFocus) {
-                                      try {
-                                          webView.evaluateJavascript("window.dispatchEvent(new Event('blur')); document.dispatchEvent(new Event('visibilitychange'));", null)
-                                      } catch (_: Exception) {}
-                                  }
-                              }
-                          } catch (_: Exception) {}
-                      }
-                  }
               }
           }
           EOF
 
-      - name: Patch Launch Script & Hook Activities Safely
+      - name: Patch Launch Script & Hook Activities
         run: |
           python3 - << 'EOF'
           import os, re
@@ -763,26 +755,15 @@ jobs:
                           with open(p, "w", encoding="utf-8") as f:
                               f.write(code)
 
-                  if fn == "MainActivity.kt":
-                      with open(p, "r", encoding="utf-8") as f:
-                          code = f.read()
-                      if "StandaloneProvisioner.attachMainActivity(this)" not in code:
-                          code = code.replace(
-                              "super.onCreate(savedInstanceState)",
-                              "super.onCreate(savedInstanceState)\n        StandaloneProvisioner.attachMainActivity(this)"
-                          )
-                          with open(p, "w", encoding="utf-8") as f:
-                              f.write(code)
-
-                  if fn == "WorkbenchActivity.kt":
+                  if fn.endswith("Activity.kt"):
                       with open(p, "r", encoding="utf-8") as f:
                           code = f.read()
                       code = code.replace('"http://127.0.0.1:8080"', '"http://127.0.0.1:8080/?folder=/root/Workspace"')
                       code = code.replace('"http://127.0.0.1:8080/"', '"http://127.0.0.1:8080/?folder=/root/Workspace"')
-                      if "StandaloneProvisioner.attachWorkbenchActivity(this)" not in code:
+                      if "StandaloneProvisioner.attachActivity(this)" not in code:
                           code = code.replace(
                               "super.onCreate(savedInstanceState)",
-                              "super.onCreate(savedInstanceState)\n        StandaloneProvisioner.attachWorkbenchActivity(this)"
+                              "super.onCreate(savedInstanceState)\n        StandaloneProvisioner.attachActivity(this)"
                           )
                       with open(p, "w", encoding="utf-8") as f:
                           f.write(code)
@@ -837,7 +818,7 @@ jobs:
       - name: Assemble Standalone APK
         run: |
           gradle wrapper --gradle-version 8.7
-          ./gradlew assembleDebug --stacktrace
+          ./gradlew assembleDebug --no-daemon
           cp app/build/outputs/apk/debug/app-debug.apk PocketVSCode-arm64.apk
 
       - name: Publish Direct APK & Keystore to GitHub Releases
@@ -848,7 +829,7 @@ jobs:
           gh release create "$RELEASE_TAG" PocketVSCode-arm64.apk pocket-vscode-permanent.keystore \
             --target "${{ github.sha }}" \
             --title "Pocket VS Code ($RELEASE_TAG)" \
-            --notes "Fixed Gradle compile, official VS Code icon, 0-100% auto-extraction loading bar, and Mode 2 auto-open + 0.5s auto-save."
+            --notes "Package ID com.pocket.vscode, official VS Code icon, 0-100% auto-extraction loading screen, Mode 2 auto-open, and 0.5s auto-save."
 
       - name: Upload Artifact Backup
         if: always()
