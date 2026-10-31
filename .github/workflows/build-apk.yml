@@ -23,7 +23,7 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Restore Folder Structure and Set New Package ID
+      - name: Restore Folder Structure and Root Configs
         run: |
           for f in app__*; do
             if [ -f "$f" ]; then
@@ -48,7 +48,7 @@ jobs:
                   mavenCentral()
               }
           }
-          rootProject.name = "VSCodeAndroidStandalone"
+          rootProject.name = "PocketVSCode"
           include(":app")
           EOF
 
@@ -66,15 +66,33 @@ jobs:
           android.nonTransitiveRClass=true
           EOF
 
+      - name: Lock Package ID (com.pocket.vscode) & Restore Permanent Keystore
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Lock applicationId to com.pocket.vscode while preserving Kotlin namespace
           find app -name "build.gradle.kts" -exec sed -i 's/applicationId = "[^"]*"/applicationId = "com.pocket.vscode"/g' {} + || true
           find app -name "build.gradle" -exec sed -i 's/applicationId "[^"]*"/applicationId "com.pocket.vscode"/g' {} + || true
 
-      - name: Setup Permanent Keystore and Version
-        run: |
-          mkdir -p ~/.android app
+          mkdir -p ~/.android app /tmp/keystore_dl
+          RESTORED=false
+
           if [ -f "app/keystore.jks" ]; then
             cp app/keystore.jks ~/.android/debug.keystore
-          else
+            RESTORED=true
+          fi
+
+          if [ "$RESTORED" = "false" ]; then
+            if gh release download --pattern "pocket-vscode-permanent.keystore" --dir /tmp/keystore_dl 2>/dev/null; then
+              if [ -f "/tmp/keystore_dl/pocket-vscode-permanent.keystore" ]; then
+                cp /tmp/keystore_dl/pocket-vscode-permanent.keystore ~/.android/debug.keystore
+                cp /tmp/keystore_dl/pocket-vscode-permanent.keystore app/keystore.jks
+                RESTORED=true
+              fi
+            fi
+          fi
+
+          if [ "$RESTORED" = "false" ]; then
             keytool -genkeypair -v \
               -keystore ~/.android/debug.keystore \
               -alias androiddebugkey \
@@ -85,17 +103,20 @@ jobs:
               -keypass android \
               -dname "CN=PocketVSCode, OU=Dev, O=Standalone, L=Bijnor, ST=UP, C=IN"
             cp ~/.android/debug.keystore app/keystore.jks
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add -f app/keystore.jks || true
-            git commit -m "chore: lock permanent keystore" || true
-            git push origin HEAD:${{ github.ref_name }} || true
           fi
+
+          cp ~/.android/debug.keystore pocket-vscode-permanent.keystore
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f app/keystore.jks || true
+          git commit -m "chore: lock permanent keystore" || true
+          git push origin HEAD:${{ github.ref_name }} || true
 
           find app -name "build.gradle.kts" -exec sed -i 's/versionCode = [0-9]*/versionCode = ${{ github.run_number }}/g' {} + || true
           find app -name "build.gradle" -exec sed -i 's/versionCode [0-9]*/versionCode ${{ github.run_number }}/g' {} + || true
 
-      - name: Generate Exact Fluent Blue Ribbon App Icons
+      - name: Generate Official Pocket VS Code Adaptive & Legacy Icons
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y python3-pil curl
@@ -104,11 +125,6 @@ jobs:
           cat > app/src/main/res/values/strings.xml << 'EOF'
           <resources>
               <string name="app_name">Pocket VS Code</string>
-          </resources>
-          EOF
-
-          cat > app/src/main/res/values/colors.xml << 'EOF'
-          <resources>
               <color name="ic_launcher_background">#1E1E1E</color>
           </resources>
           EOF
@@ -116,14 +132,13 @@ jobs:
           rm -rf app/src/main/res/mipmap-anydpi*
           rm -rf app/src/main/res/drawable*/ic_launcher*
 
-          curl -fSL "https://cdn.jsdelivr.net/gh/microsoft/vscode/resources/linux/code.png" -o vscode_ribbon.png || \
-          curl -fSL "https://raw.githubusercontent.com/microsoft/vscode/main/resources/linux/code.png" -o vscode_ribbon.png
+          curl -fSL "https://raw.githubusercontent.com/microsoft/vscode/main/resources/linux/code.png" -o vscode_icon.png
 
           python3 - << 'EOF'
           import os, re
           from PIL import Image
 
-          img = Image.open("vscode_ribbon.png").convert("RGBA")
+          img = Image.open("vscode_icon.png").convert("RGBA")
 
           v26_dir = "app/src/main/res/mipmap-anydpi-v26"
           os.makedirs(v26_dir, exist_ok=True)
@@ -150,15 +165,21 @@ jobs:
               dest_dir = os.path.join("app/src/main/res", folder)
               os.makedirs(dest_dir, exist_ok=True)
 
-              legacy_icon = img.resize((legacy_size, legacy_size), Image.Resampling.LANCZOS)
-              legacy_icon.save(os.path.join(dest_dir, "ic_launcher.png"))
-              legacy_icon.save(os.path.join(dest_dir, "ic_launcher_round.png"))
+              # Standard legacy icon with dark rounded pad
+              bg_card = Image.new("RGBA", (legacy_size, legacy_size), (30, 30, 30, 255))
+              pad = int(legacy_size * 0.78)
+              icon_resized = img.resize((pad, pad), Image.Resampling.LANCZOS)
+              off = (legacy_size - pad) // 2
+              bg_card.paste(icon_resized, (off, off), icon_resized)
+              bg_card.save(os.path.join(dest_dir, "ic_launcher.png"))
+              bg_card.save(os.path.join(dest_dir, "ic_launcher_round.png"))
 
+              # Adaptive foreground icon (66% safe zone)
               fg = Image.new("RGBA", (adaptive_size, adaptive_size), (0, 0, 0, 0))
-              inner_adapt = int(adaptive_size * 0.72)
-              resized_adapt = img.resize((inner_adapt, inner_adapt), Image.Resampling.LANCZOS)
-              offset_a = (adaptive_size - inner_adapt) // 2
-              fg.paste(resized_adapt, (offset_a, offset_a), resized_adapt)
+              inner_size = int(adaptive_size * 0.64)
+              inner_img = img.resize((inner_size, inner_size), Image.Resampling.LANCZOS)
+              offset = (adaptive_size - inner_size) // 2
+              fg.paste(inner_img, (offset, offset), inner_img)
               fg.save(os.path.join(dest_dir, "ic_launcher_foreground.png"))
 
           for root, _, files in os.walk("app/src/main"):
@@ -178,11 +199,9 @@ jobs:
                       c = re.sub(r'android:label="[^"]*"', 'android:label="@string/app_name"', c)
                       with open(mpath, "w", encoding="utf-8") as f:
                           f.write(c)
-
-          print("Generated Fluent Ribbon Icons successfully.")
           EOF
 
-      - name: Pre-Bundle Debian Rootfs and Official VS Code
+      - name: Pre-Bundle Debian Rootfs and Official VS Code into APK Assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -223,155 +242,7 @@ jobs:
           EOF
           curl -fSL -H "User-Agent: Mozilla/5.0" "https://update.code.visualstudio.com/latest/linux-arm64/stable" -o app/src/main/assets/vscode-linux-arm64.tar.gz
 
-      - name: Configure Launch Scripts with Auto-Save & Non-Root UI
-        run: |
-          python3 - << 'EOF'
-          import os, re
-
-          script_path = "app/src/main/assets/start-vscode-session.sh"
-          with open(script_path, "r", encoding="utf-8") as f:
-              orig = f.read()
-
-          orig = orig.replace("--I-KNOW-THIS-IS-INSECURE", "")
-          orig = re.sub(r'1280x720|1280x800|1024x768', '1920x1080', orig)
-          orig = re.sub(r'--extensions-dir\s+\S+\s*(\\?\n)?', '', orig)
-          orig = re.sub(r'(serve-web[\s\S]*?)--user-data-dir', r'\1--server-data-dir', orig)
-
-          if "/opt/vscode-arm64/code" in orig and "--disable-gpu" not in orig:
-              orig = orig.replace("/opt/vscode-arm64/code", "/opt/vscode-arm64/code --no-sandbox --disable-gpu --disable-dev-shm-usage --disable-software-rasterizer")
-
-          orig = orig.replace("/opt/vscode-arm64/bin/code serve-web", "/usr/local/bin/code-serve-web-smart")
-
-          header_patch = """#!/bin/bash
-          mkdir -p /tmp /dev/shm /root/.config/Code/User /root/.vscode-server-data/data/Machine /root/.vscode-server-data/data/User /root/Workspace /usr/local/bin
-          chmod 1777 /tmp /dev/shm || true
-
-          if [ ! -f /usr/local/bin/sudo ]; then
-              printf '#!/bin/sh\\nexec "$@"\\n' > /usr/local/bin/sudo
-              chmod 755 /usr/local/bin/sudo
-          fi
-
-          if [ -f /opt/vscode-arm64/bin/code ]; then
-              sed -i 's|/proc/version|/dev/null|g' /opt/vscode-arm64/bin/code || true
-          fi
-
-          for S_PATH in "/root/.config/Code/User/settings.json" "/root/.vscode-server-data/data/Machine/settings.json" "/root/.vscode-server-data/data/User/settings.json"; do
-              if [ ! -f "$S_PATH" ]; then
-                  cat > "$S_PATH" << 'JSONEOF'
-          {
-              "files.autoSave": "afterDelay",
-              "files.autoSaveDelay": 500,
-              "files.hotExit": "onExitAndWindowClose",
-              "window.restoreWindows": "all",
-              "workbench.startupEditor": "none"
-          }
-          JSONEOF
-              fi
-          done
-
-          cat > /usr/local/bin/code-serve-web-smart << 'WRAPEOF'
-          #!/bin/bash
-          if pgrep -f "code-tunnel.*serve-web" >/dev/null 2>&1 || pgrep -f "opt/vscode-arm64.*serve-web" >/dev/null 2>&1; then
-              echo "[start-vscode] Resuming active Mode 2 session..."
-              while pgrep -f "serve-web" >/dev/null 2>&1; do
-                  sleep 2
-              done
-              exit 0
-          fi
-
-          exec /opt/vscode-arm64/bin/code serve-web \\
-              --host 127.0.0.1 \\
-              --port 8080 \\
-              --without-connection-token \\
-              --accept-server-license-terms \\
-              --server-data-dir /root/.vscode-server-data
-          WRAPEOF
-          chmod 755 /usr/local/bin/code-serve-web-smart
-
-          if [ ! -f /opt/vscode-arm64/.noroot_patched ] && [ -d /opt/vscode-arm64/resources/app/out ]; then
-              find /opt/vscode-arm64/resources/app/out -name "preload*.js" -exec sed -i 's/process\.getuid()/1000/g' {} + || true
-              WB_JS="/opt/vscode-arm64/resources/app/out/vs/workbench/workbench.desktop.main.js"
-              if [ -f "$WB_JS" ]; then
-                  sed -i 's/\.getuid\?\.()===0/false/g; s/\.getuid()===0/false/g; s/ \[Superuser\]//g; s/\[Superuser\]//g' "$WB_JS" || true
-              fi
-              touch /opt/vscode-arm64/.noroot_patched
-          fi
-
-          if [ "$1" != "direct" ]; then
-              pkill -9 -f Xtigervnc || true
-              pkill -9 -f websockify || true
-              pkill -9 -f openbox || true
-              rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1 /tmp/.X*-lock /tmp/.X11-unix/X*
-              sleep 1
-          fi
-          """
-
-          if orig.startswith("#!/"):
-              orig = re.sub(r'^#!/[^\n]*\n', header_patch + "\n", orig, count=1)
-          else:
-              orig = header_patch + "\n" + orig
-
-          with open(script_path, "w", encoding="utf-8") as f:
-              f.write(orig)
-          os.chmod(script_path, 0o755)
-          EOF
-
-      - name: Inject Safe Zero-Click Auto-Launch in MainActivity
-        run: |
-          python3 - << 'EOF'
-          import os, re
-
-          for root, _, files in os.walk("app/src/main/java"):
-              for fn in files:
-                  if fn == "MainActivity.kt":
-                      p = os.path.join(root, fn)
-                      with open(p, "r", encoding="utf-8") as f:
-                          code = f.read()
-
-                      # Revert any previously broken injection
-                      code = re.sub(r'// Auto-Launch Genuine VS Code[\s\S]*?performClick\(\)\s*\}', '', code)
-                      code = re.sub(r'logOutput\(.*?\)', '', code)
-
-                      # Safe UI traversal auto-launch: Runs after activity layout renders completely
-                      safe_autolaunch = """
-                              window.decorView.postDelayed({
-                                  fun findButton(v: android.view.View, keyword: String): android.widget.Button? {
-                                      if (v is android.widget.Button && v.text.toString().uppercase().contains(keyword)) return v
-                                      if (v is android.view.ViewGroup) {
-                                          for (i in 0 until v.childCount) {
-                                              val b = findButton(v.getChildAt(i), keyword)
-                                              if (b != null) return b
-                                          }
-                                      }
-                                      return null
-                                  }
-
-                                  val isInstalled = java.io.File(filesDir, "debian-rootfs/bin/bash").exists() || 
-                                                    java.io.File(filesDir, "rootfs/bin/bash").exists() ||
-                                                    java.io.File(filesDir, "usr/bin/bash").exists()
-
-                                  if (isInstalled) {
-                                      findButton(window.decorView, "LAUNCH")?.performClick()
-                                  } else {
-                                      findButton(window.decorView, "INSTALL")?.performClick()
-                                  }
-                              }, 1200)
-                      """
-
-                      if "findButton(window.decorView" not in code:
-                          code = re.sub(
-                              r'(override\s+fun\s+onCreate[^{]+\{[\s\S]*?setContentView\([^)]+\))',
-                              r'\1\n' + safe_autolaunch,
-                              code,
-                              count=1
-                          )
-
-                      with open(p, "w", encoding="utf-8") as f:
-                          f.write(code)
-                      print("Injected safe Zero-Click Auto-Launch.")
-          EOF
-
-      - name: Configure Universal Asset Unpacker
+      - name: Configure StandaloneProvisioner with 0% to 100% Real-Time Progress
         run: |
           STANDALONE_PROV="app/src/main/java/com/vscode/desktop/standalone/StandaloneProvisioner.kt"
           mkdir -p "$(dirname "$STANDALONE_PROV")"
@@ -388,39 +259,52 @@ jobs:
 
           class StandaloneProvisioner(private val context: Context, private val prootManager: ProotProcessManager) {
 
+              fun isProvisioned(): Boolean {
+                  return File(prootManager.rootfsDir, "bin/bash").exists() &&
+                         File(prootManager.rootfsDir, "opt/vscode-arm64/bin/code").exists()
+              }
+
               fun provisionAll(onProgress: (String) -> Unit): Boolean {
                   return try {
+                      onProgress("[PROGRESS:2] Preparing offline installation environment (2%)...")
                       exportAssetScripts()
+
                       if (!File(prootManager.rootfsDir, "bin/bash").exists()) {
-                          onProgress("1/3 Setting up Linux Environment...")
+                          onProgress("[PROGRESS:5] Step 1/3: Extracting Debian ARM64 Linux (5%)...")
                           val assetList = context.assets.list("") ?: emptyArray()
                           val rootfsAsset = assetList.firstOrNull { it.startsWith("debian-rootfs.tar") }
                               ?: throw IOException("Pre-bundled debian-rootfs asset not found!")
                           context.assets.open(rootfsAsset).use { input ->
-                              extractTarFromStream(input, prootManager.rootfsDir, onProgress)
+                              extractTarFromStream(input, prootManager.rootfsDir, 5, 45, 6500, "Debian Linux", onProgress)
                           }
                       } else {
-                          onProgress("1/3 Linux Environment ready.")
+                          onProgress("[PROGRESS:45] Step 1/3: Debian Rootfs already extracted (45%).")
                       }
 
                       val vscodeDir = File(prootManager.rootfsDir, "opt/vscode-arm64")
                       if (!File(vscodeDir, "bin/code").exists()) {
                           vscodeDir.mkdirs()
-                          onProgress("2/3 Unpacking Microsoft VS Code...")
+                          onProgress("[PROGRESS:48] Step 2/3: Extracting Official Microsoft VS Code (48%)...")
                           val assetList = context.assets.list("") ?: emptyArray()
                           val vscodeAsset = assetList.firstOrNull { it.startsWith("vscode-linux-arm64") }
                               ?: throw IOException("Pre-bundled vscode-linux-arm64 asset not found!")
                           context.assets.open(vscodeAsset).use { input ->
-                              extractTarFromStream(input, vscodeDir, onProgress)
+                              extractTarFromStream(input, vscodeDir, 48, 88, 4500, "VS Code", onProgress)
                           }
                       } else {
-                          onProgress("2/3 Microsoft VS Code ready.")
+                          onProgress("[PROGRESS:88] Step 2/3: Official VS Code already extracted (88%).")
                       }
 
-                      onProgress("3/3 Finalizing Workbench...")
-                      val p = prootManager.startProotCommand("bash /root/init-rootfs.sh", prootManager.homeDir.absolutePath, onLogLine = onProgress)
+                      onProgress("[PROGRESS:92] Step 3/3: Configuring Linux permissions & user profile (92%)...")
+                      val p = prootManager.startProotCommand("bash /root/init-rootfs.sh", prootManager.homeDir.absolutePath, onLogLine = { line ->
+                          onProgress("[PROGRESS:96] $line")
+                      })
                       val exit = p.waitFor()
-                      onProgress("Provisioning finished with code $exit")
+                      if (exit == 0) {
+                          onProgress("[PROGRESS:100] Installation 100% Complete! Ready to Launch.")
+                      } else {
+                          onProgress("Provisioning finished with code $exit")
+                      }
                       exit == 0
                   } catch (e: Exception) {
                       onProgress("ERROR during provisioning: ${e.message}")
@@ -439,7 +323,15 @@ jobs:
                   }
               }
 
-              private fun extractTarFromStream(inputStream: InputStream, destDir: File, onProgress: (String) -> Unit) {
+              private fun extractTarFromStream(
+                  inputStream: InputStream,
+                  destDir: File,
+                  startPct: Int,
+                  endPct: Int,
+                  estimatedTotal: Int,
+                  label: String,
+                  onProgress: (String) -> Unit
+              ) {
                   val bufferedIn = BufferedInputStream(inputStream, 128 * 1024)
                   val pushback = PushbackInputStream(bufferedIn, 512)
                   val header = ByteArray(6)
@@ -484,7 +376,11 @@ jobs:
                               }
                           }
                           count++
-                          if (count % 3000 == 0) onProgress("Unpacking files...")
+                          if (count % 400 == 0) {
+                              val span = endPct - startPct
+                              val pct = (startPct + (count * span / estimatedTotal)).coerceIn(startPct, endPct)
+                              onProgress("[PROGRESS:$pct] Extracting $label ($pct%) - $count files unpacked...")
+                          }
                           entry = tar.nextTarEntry
                       }
                   }
@@ -492,7 +388,324 @@ jobs:
           }
           EOF
 
-      - name: Fetch and Patch ARM64 Binaries
+      - name: Patch Launch Script, Auto-Extraction UI, & Mode 2 Auto-Open + 0.5s Auto-Save
+        run: |
+          python3 - << 'EOF'
+          import os, re
+
+          # 1. Patch start-vscode-session.sh for Mode 2 (0.5s Auto-Save, Session Restore, 10m Idle Hibernate) & Mode 1 (High Perf Non-Root UI)
+          script_path = "app/src/main/assets/start-vscode-session.sh"
+          with open(script_path, "r", encoding="utf-8") as f:
+              orig = f.read()
+
+          orig = orig.replace("--I-KNOW-THIS-IS-INSECURE", "")
+          orig = re.sub(r'1280x720|1280x800|1024x768', '1920x1080', orig)
+          orig = re.sub(r'--extensions-dir\s+\S+\s*(\\?\n)?', '', orig)
+          orig = re.sub(r'(serve-web[\s\S]*?)--user-data-dir', r'\1--server-data-dir', orig)
+
+          if "/opt/vscode-arm64/code" in orig and "--disable-gpu" not in orig:
+              orig = orig.replace("/opt/vscode-arm64/code", "/opt/vscode-arm64/code --no-sandbox --disable-gpu --disable-dev-shm-usage --disable-software-rasterizer")
+
+          orig = orig.replace("/opt/vscode-arm64/bin/code serve-web", "/usr/local/bin/code-serve-web-smart")
+
+          header_patch = """#!/bin/bash
+          mkdir -p /tmp /dev/shm /root/.config/Code/User /root/.vscode-server-data/data/Machine /root/.vscode-server-data/data/User /root/Workspace /usr/local/bin
+          chmod 1777 /tmp /dev/shm || true
+
+          if [ ! -f /usr/local/bin/sudo ]; then
+              printf '#!/bin/sh\\nexec "$@"\\n' > /usr/local/bin/sudo
+              chmod 755 /usr/local/bin/sudo
+          fi
+
+          if [ -f /opt/vscode-arm64/bin/code ]; then
+              sed -i 's|/proc/version|/dev/null|g' /opt/vscode-arm64/bin/code || true
+          fi
+
+          # Mode 2 Specific 0.5s Auto-Save, Hot-Exit Session Persistence, and Battery Optimization
+          for S_PATH in "/root/.vscode-server-data/data/Machine/settings.json" "/root/.vscode-server-data/data/User/settings.json"; do
+              cat > "$S_PATH" << 'JSONEOF'
+          {
+              "files.autoSave": "afterDelay",
+              "files.autoSaveDelay": 500,
+              "files.hotExit": "onExitAndWindowClose",
+              "window.restoreWindows": "all",
+              "workbench.startupEditor": "none",
+              "telemetry.telemetryLevel": "off",
+              "extensions.autoCheckUpdates": false,
+              "extensions.autoUpdate": false,
+              "update.mode": "none",
+              "files.watcherExclude": {
+                  "**/.git/objects/**": true,
+                  "**/.git/subtree-cache/**": true,
+                  "**/node_modules/*/**": true,
+                  "**/build/**": true,
+                  "**/.gradle/**": true
+              }
+          }
+          JSONEOF
+          done
+
+          # Mode 2 Smart Wrapper: Auto-resumes existing session & hibernates after 10 mins of closed browser/webview
+          cat > /usr/local/bin/code-serve-web-smart << 'WRAPEOF'
+          #!/bin/bash
+          start_mode2_idle_watcher() {
+              (
+                  IDLE_SECONDS=0
+                  while pgrep -f "serve-web" >/dev/null 2>&1; do
+                      sleep 30
+                      if grep -q ":1F90 .* 01 " /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+                          IDLE_SECONDS=0
+                      else
+                          IDLE_SECONDS=$((IDLE_SECONDS + 30))
+                      fi
+                      if [ "$IDLE_SECONDS" -ge 600 ]; then
+                          echo "[battery-saver] Mode 2 inactive for 10 mins. Auto-saving and hibernating server..."
+                          pkill -15 -f "serve-web" || true
+                          exit 0
+                      fi
+                  done
+              ) &
+          }
+
+          if pgrep -f "code-tunnel.*serve-web" >/dev/null 2>&1 || pgrep -f "opt/vscode-arm64.*serve-web" >/dev/null 2>&1; then
+              echo "[start-vscode] Resuming active Mode 2 session..."
+              echo "Web UI available at http://127.0.0.1:8080/?folder=/root/Workspace"
+              while pgrep -f "serve-web" >/dev/null 2>&1; do
+                  sleep 3
+              done
+              exit 0
+          fi
+
+          start_mode2_idle_watcher
+          exec nice -n 10 /opt/vscode-arm64/bin/code serve-web \\
+              --host 127.0.0.1 \\
+              --port 8080 \\
+              --without-connection-token \\
+              --accept-server-license-terms \\
+              --server-data-dir /root/.vscode-server-data
+          WRAPEOF
+          chmod 755 /usr/local/bin/code-serve-web-smart
+
+          # Mode 1 Non-Root UI Patch (Removes [Superuser] and root warning)
+          if [ ! -f /opt/vscode-arm64/.noroot_patched ] && [ -d /opt/vscode-arm64/resources/app/out ]; then
+              find /opt/vscode-arm64/resources/app/out -name "preload*.js" -exec sed -i 's/process\.getuid()/1000/g' {} + || true
+              WB_JS="/opt/vscode-arm64/resources/app/out/vs/workbench/workbench.desktop.main.js"
+              if [ -f "$WB_JS" ]; then
+                  sed -i 's/\.getuid\?\.()===0/false/g; s/\.getuid()===0/false/g; s/ \[Superuser\]//g; s/\[Superuser\]//g' "$WB_JS" || true
+              fi
+              touch /opt/vscode-arm64/.noroot_patched
+          fi
+
+          if [ "$1" = "direct" ]; then
+              exec /usr/local/bin/code-serve-web-smart
+          else
+              pkill -9 -f Xtigervnc || true
+              pkill -9 -f websockify || true
+              pkill -9 -f openbox || true
+              rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1 /tmp/.X*-lock /tmp/.X11-unix/X*
+              sleep 1
+          fi
+          """
+
+          if orig.startswith("#!/"):
+              orig = re.sub(r'^#!/[^\n]*\n', header_patch + "\n", orig, count=1)
+          else:
+              orig = header_patch + "\n" + orig
+
+          with open(script_path, "w", encoding="utf-8") as f:
+              f.write(orig)
+          os.chmod(script_path, 0o755)
+
+          # 2. Patch ProotProcessManager, MainActivity, and WorkbenchActivity
+          for root, _, files in os.walk("app/src/main/java"):
+              for fn in files:
+                  p = os.path.join(root, fn)
+                  if fn == "ProotProcessManager.kt":
+                      with open(p, "r", encoding="utf-8") as f:
+                          code = f.read()
+                      sync_snippet = """
+                      try {
+                          val rDir = File(rootfsDir, "root").apply { mkdirs() }
+                          listOf("init-rootfs.sh", "start-vscode-session.sh", "verify-vscode.sh").forEach { name ->
+                              val out = File(rDir, name)
+                              context.assets.open(name).use { inp -> java.io.FileOutputStream(out).use { o -> inp.copyTo(o) } }
+                              out.setExecutable(true, false)
+                          }
+                      } catch (_: Exception) {}
+                      """
+                      if "start-vscode-session.sh" not in code:
+                          code = re.sub(
+                              r'(fun\s+startProotCommand\s*\([^)]*\)\s*:\s*Process\s*\{)',
+                              r'\1\n' + sync_snippet,
+                              code,
+                              count=1
+                          )
+                          with open(p, "w", encoding="utf-8") as f:
+                              f.write(code)
+
+                  if fn == "MainActivity.kt":
+                      with open(p, "r", encoding="utf-8") as f:
+                          code = f.read()
+
+                      # Inject Progress Dialog / 0-100% Loading Screen & Auto-Extraction + Mode 2 Auto-Open Helper into MainActivity
+                      helper_methods = """
+                      private var progressDialog: android.app.AlertDialog? = null
+                      private var progressBarView: android.widget.ProgressBar? = null
+                      private var progressTextView: android.widget.TextView? = null
+                      private var autoInstallRunning = false
+                      private var mode2AutoOpened = false
+
+                      private fun updateLoadingScreen(pct: Int, message: String) {
+                          runOnUiThread {
+                              if (progressDialog == null) {
+                                  val container = android.widget.LinearLayout(this).apply {
+                                      orientation = android.widget.LinearLayout.VERTICAL
+                                      setPadding(60, 50, 60, 50)
+                                      setBackgroundColor(android.graphics.Color.parseColor("#1E1E1E"))
+                                  }
+                                  val title = android.widget.TextView(this).apply {
+                                      text = "Setting up Pocket VS Code..."
+                                      textSize = 18f
+                                      setTextColor(android.graphics.Color.WHITE)
+                                      setPadding(0, 0, 0, 24)
+                                  }
+                                  progressBarView = android.widget.ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+                                      max = 100
+                                      progress = pct
+                                      minimumHeight = 24
+                                  }
+                                  progressTextView = android.widget.TextView(this).apply {
+                                      text = "$pct% - $message"
+                                      textSize = 14f
+                                      setTextColor(android.graphics.Color.parseColor("#0098FF"))
+                                      setPadding(0, 20, 0, 0)
+                                  }
+                                  container.addView(title)
+                                  container.addView(progressBarView)
+                                  container.addView(progressTextView)
+                                  progressDialog = android.app.AlertDialog.Builder(this)
+                                      .setView(container)
+                                      .setCancelable(false)
+                                      .create()
+                              }
+                              progressBarView?.progress = pct
+                              progressTextView?.text = message
+                              if (pct in 1..99) {
+                                  if (progressDialog?.isShowing == false) progressDialog?.show()
+                              } else if (pct >= 100) {
+                                  progressBarView?.progress = 100
+                                  progressTextView?.text = "100% - Setup Complete!"
+                                  android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                                      try { progressDialog?.dismiss() } catch (_: Exception) {}
+                                  }, 800)
+                              }
+                          }
+                      }
+
+                      private fun checkAutoTriggerExtractionAndLog(msg: String) {
+                          val regex = Regex("\\\\[PROGRESS:(\\\\d+)\\\\]\\\\s*(.*)")
+                          val match = regex.find(msg)
+                          if (match != null) {
+                              val pct = match.groupValues[1].toIntOrNull() ?: 0
+                              val cleanMsg = match.groupValues[2]
+                              updateLoadingScreen(pct, cleanMsg)
+                          }
+                          if (msg.contains("Selected Android Project Folder") && !autoInstallRunning) {
+                              val prov = StandaloneProvisioner(this, prootManager)
+                              if (!prov.isProvisioned()) {
+                                  autoInstallRunning = true
+                                  updateLoadingScreen(1, "Starting automatic background extraction (1%)...")
+                                  Thread {
+                                      prov.provisionAll { line ->
+                                          checkAutoTriggerExtractionAndLog(line)
+                                      }
+                                      autoInstallRunning = false
+                                  }.start()
+                              }
+                          }
+                          if ((msg.contains("Web UI available at") || msg.contains("127.0.0.1:8080") || msg.contains("Resuming active Mode 2")) && !mode2AutoOpened) {
+                              mode2AutoOpened = true
+                              runOnUiThread {
+                                  android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                                      try {
+                                          val intent = android.content.Intent(this, WorkbenchActivity::class.java).apply {
+                                              putExtra("mode", "direct")
+                                              putExtra("url", "http://127.0.0.1:8080/?folder=/root/Workspace")
+                                          }
+                                          startActivity(intent)
+                                      } catch (e: Exception) {
+                                          try {
+                                              startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("http://127.0.0.1:8080/?folder=/root/Workspace")))
+                                          } catch (_: Exception) {}
+                                      }
+                                      android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({ mode2AutoOpened = false }, 5000)
+                                  }, 600)
+                              }
+                          }
+                      }
+                      """
+
+                      if "checkAutoTriggerExtractionAndLog" not in code:
+                          # Hook into any log appending method in MainActivity
+                          code = re.sub(
+                              r'(fun\s+appendLog\s*\(\s*(\w+)\s*:\s*String\s*\)\s*\{)',
+                              r'\1\n        checkAutoTriggerExtractionAndLog(\2)',
+                              code
+                          )
+                          code = re.sub(r'(\}\s*)$', helper_methods + "\n}", code, count=1)
+
+                      with open(p, "w", encoding="utf-8") as f:
+                          f.write(code)
+
+                  if fn == "WorkbenchActivity.kt":
+                      with open(p, "r", encoding="utf-8") as f:
+                          code = f.read()
+
+                      code = code.replace('"http://127.0.0.1:8080"', '"http://127.0.0.1:8080/?folder=/root/Workspace"')
+                      code = code.replace('"http://127.0.0.1:8080/"', '"http://127.0.0.1:8080/?folder=/root/Workspace"')
+
+                      if ".loadUrl(" in code and "shouldOverrideUrlLoading" not in code:
+                          wv_chain = """.apply {
+                              settings.javaScriptEnabled = true
+                              settings.domStorageEnabled = true
+                              settings.databaseEnabled = true
+                              webViewClient = object : android.webkit.WebViewClient() {
+                                  override fun shouldOverrideUrlLoading(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): Boolean = false
+                                  @Deprecated("Deprecated in Java")
+                                  override fun shouldOverrideUrlLoading(view: android.webkit.WebView?, url: String?): Boolean = false
+                                  override fun onReceivedError(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?, error: android.webkit.WebResourceError?) {
+                                      if (request?.isForMainFrame == true) {
+                                          view?.postDelayed({ view.reload() }, 1000)
+                                      }
+                                  }
+                              }
+                          }.loadUrl("""
+                          code = code.replace(".loadUrl(", wv_chain)
+
+                      if "override fun onPause()" not in code:
+                          lifecycle_patch = """
+                          override fun onPause() {
+                              try {
+                                  webView.evaluateJavascript("window.dispatchEvent(new Event('blur')); document.dispatchEvent(new Event('visibilitychange'));", null)
+                                  webView.onPause()
+                              } catch (_: Exception) {}
+                              super.onPause()
+                          }
+
+                          override fun onResume() {
+                              super.onResume()
+                              try {
+                                  webView.onResume()
+                              } catch (_: Exception) {}
+                          }
+                          """
+                          code = re.sub(r'(\}\s*)$', lifecycle_patch + "\n}", code, count=1)
+
+                      with open(p, "w", encoding="utf-8") as f:
+                          f.write(code)
+          EOF
+
+      - name: Fetch and Patch ARM64 Binaries (libproot, libtalloc, libandroid-shmem)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y patchelf
@@ -538,21 +751,21 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
 
-      - name: Assemble Standalone APK with Full Signing
+      - name: Assemble Standalone APK
         run: |
           gradle wrapper --gradle-version 8.7
           ./gradlew assembleDebug --stacktrace
           cp app/build/outputs/apk/debug/app-debug.apk PocketVSCode-arm64.apk
 
-      - name: Publish Direct APK to GitHub Releases
+      - name: Publish Direct APK & Keystore to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           RELEASE_TAG="v1.0.${{ github.run_number }}"
-          gh release create "$RELEASE_TAG" PocketVSCode-arm64.apk \
+          gh release create "$RELEASE_TAG" PocketVSCode-arm64.apk pocket-vscode-permanent.keystore \
             --target "${{ github.sha }}" \
             --title "Pocket VS Code ($RELEASE_TAG)" \
-            --notes "Fixed Gradle compilation error. Direct auto-launch with official Fluent ribbon VS Code icon."
+            --notes "Added official VS Code icon, 0-100% auto-extraction loading screen on folder select, Mode 2 auto-open, and 0.5s auto-save."
 
       - name: Upload Artifact Backup
         if: always()
