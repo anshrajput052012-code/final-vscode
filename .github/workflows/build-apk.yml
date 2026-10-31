@@ -127,7 +127,6 @@ jobs:
           </resources>
           EOF
 
-          # Remove adaptive XMLs so Android uses high-res VS Code PNG mipmaps directly without AAPT2 conflicts
           rm -rf app/src/main/res/mipmap-anydpi*
           rm -rf app/src/main/res/drawable*/ic_launcher*
 
@@ -151,7 +150,6 @@ jobs:
               dest_dir = os.path.join("app/src/main/res", folder)
               os.makedirs(dest_dir, exist_ok=True)
 
-              # Dark background card with centered official blue VS Code icon
               card = Image.new("RGBA", (size, size), (30, 30, 30, 255))
               inner = int(size * 0.76)
               logo = img.resize((inner, inner), Image.Resampling.LANCZOS)
@@ -159,7 +157,6 @@ jobs:
               card.paste(logo, (off, off), logo)
               card.save(os.path.join(dest_dir, "ic_launcher.png"))
 
-              # Circular mask for roundIcon
               mask = Image.new("L", (size, size), 0)
               draw = ImageDraw.Draw(mask)
               draw.ellipse((0, 0, size - 1, size - 1), fill=255)
@@ -352,15 +349,15 @@ jobs:
                           val vscodeAsset = assetList.firstOrNull { it.startsWith("vscode-linux-arm64") }
                               ?: throw IOException("Pre-bundled vscode-linux-arm64 asset not found!")
                           context.assets.open(vscodeAsset).use { input ->
-                              extractTarFromStream(input, vscodeDir, 50, 90, 4500, "VS Code", onProgress)
+                              extractTarFromStream(input, vscodeDir, 50, 88, 4500, "VS Code", onProgress)
                           }
                       } else {
-                          updateProgressUi(90, "Step 2/3: Official VS Code already installed.")
-                          onProgress("90% - Step 2/3: Official VS Code already installed.")
+                          updateProgressUi(88, "Step 2/3: Official VS Code already installed.")
+                          onProgress("88% - Step 2/3: Official VS Code already installed.")
                       }
 
-                      updateProgressUi(94, "Step 3/3: Configuring Linux environment...")
-                      onProgress("94% - Step 3/3: Configuring Environment...")
+                      updateProgressUi(92, "Step 3/3: Repairing & installing X11 + VS Code libs...")
+                      onProgress("92% - Step 3/3: Configuring Environment & Installing Dependencies...")
                       val p = prootManager.startProotCommand("bash /root/init-rootfs.sh", prootManager.homeDir.absolutePath, onLogLine = onProgress)
                       val exit = p.waitFor()
                       if (exit == 0) {
@@ -509,7 +506,6 @@ jobs:
                               val allViews = mutableListOf<View>()
                               collectViews(activity.window.decorView.rootView, allViews)
 
-                              // Configure any WebView present in this Activity
                               allViews.filterIsInstance<WebView>().forEach { webView ->
                                   webView.settings.javaScriptEnabled = true
                                   webView.settings.domStorageEnabled = true
@@ -545,8 +541,8 @@ jobs:
                                       override fun afterTextChanged(s: Editable?) {
                                           val cur = s?.toString() ?: ""
                                           if (cur.isNotEmpty() && cur != initialFolderText && !autoExtractTriggered) {
-                                              val installedNow = File(activity.filesDir, "rootfs/opt/vscode-arm64/bin/code").exists()
-                                              if (!installedNow) {
+                                              val depsReady = File(activity.filesDir, "rootfs/usr/bin/Xtigervnc").exists()
+                                              if (!depsReady) {
                                                   autoExtractTriggered = true
                                                   Handler(Looper.getMainLooper()).postDelayed({
                                                       installBtn?.performClick()
@@ -564,8 +560,8 @@ jobs:
                                       override fun afterTextChanged(s: Editable?) {
                                           val logs = s?.toString() ?: ""
                                           if (logs.contains("Selected Android Project Folder:") && !autoExtractTriggered) {
-                                              val installedNow = File(activity.filesDir, "rootfs/opt/vscode-arm64/bin/code").exists()
-                                              if (!installedNow) {
+                                              val depsReady = File(activity.filesDir, "rootfs/usr/bin/Xtigervnc").exists()
+                                              if (!depsReady) {
                                                   autoExtractTriggered = true
                                                   Handler(Looper.getMainLooper()).postDelayed({
                                                       installBtn?.performClick()
@@ -605,8 +601,71 @@ jobs:
           }
           EOF
 
-      - name: Patch Launch Script & Hook Activities
+      - name: Repair init-rootfs.sh (Fix dpkg Interrupted & Missing libnspr4/Xtigervnc) & Patch Launch Script
         run: |
+          mkdir -p app/src/main/assets
+
+          cat > app/src/main/assets/init-rootfs.sh << 'EOF'
+          #!/bin/bash
+          export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          export HOME=/root
+          export USER=root
+          export DEBIAN_FRONTEND=noninteractive
+
+          mkdir -p /tmp /tmp/runtime-root /dev/shm /var/lib/dpkg/updates /var/lib/dpkg/info /var/cache/apt/archives/partial /etc/apt/apt.conf.d /root/Workspace
+          chmod 1777 /tmp /dev/shm || true
+          chmod 0700 /tmp/runtime-root || true
+
+          # Ensure reliable DNS inside PRoot
+          rm -f /etc/resolv.conf 2>/dev/null || true
+          printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" > /etc/resolv.conf
+
+          # Disable apt sandboxing and force non-interactive dpkg recovery inside PRoot
+          cat > /etc/apt/apt.conf.d/99proot << 'APTEOF'
+          APT::Sandbox::User "root";
+          Acquire::Retries "3";
+          Dpkg::Options {
+             "--force-confdef";
+             "--force-confold";
+             "--force-overwrite";
+          };
+          APTEOF
+
+          echo "[init-rootfs] Cleaning stale dpkg locks and repairing interrupted packages..."
+          rm -f /var/lib/dpkg/lock* /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null || true
+          dpkg --configure -a --force-all || true
+          apt-get install -f -y || true
+
+          echo "[init-rootfs] Updating Debian ARM64 packages and installing X11 + VS Code dependencies..."
+          apt-get update -y || true
+          dpkg --configure -a --force-all || true
+
+          # Install essential Electron shared libraries (libnspr4, libnss3), Xtigervnc, Openbox, Websockify, noVNC, and tools
+          apt-get install -y --no-install-recommends \
+              ca-certificates file curl git python3 procps \
+              libnspr4 libnss3 libgbm1 libxkbcommon0 libxcomposite1 \
+              libxdamage1 libxfixes3 libxrandr2 libcairo2 libpango-1.0-0 \
+              libpangocairo-1.0-0 libdrm2 libx11-xcb1 libxcb-dri3-0 \
+              libxshmfence1 libsecret-1-0 dbus dbus-x11 x11-xserver-utils \
+              tigervnc-standalone-server openbox websockify novnc || true
+
+          # Install t64 / standard GTK & audio libraries (supports both Debian Bookworm and Trixie)
+          apt-get install -y --no-install-recommends \
+              libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libgtk-3-0t64 libasound2t64 2>/dev/null || \
+          apt-get install -y --no-install-recommends \
+              libatk1.0-0 libatk-bridge2.0-0 libcups2 libgtk-3-0 libasound2 || true
+
+          dpkg --configure -a --force-all || true
+
+          if [ -f /opt/vscode-arm64/bin/code ]; then
+              sed -i 's|/proc/version|/dev/null|g' /opt/vscode-arm64/bin/code || true
+          fi
+
+          echo "[init-rootfs] Environment setup complete!"
+          exit 0
+          EOF
+          chmod 755 app/src/main/assets/init-rootfs.sh
+
           python3 - << 'EOF'
           import os, re
 
@@ -625,8 +684,11 @@ jobs:
           orig = orig.replace("/opt/vscode-arm64/bin/code serve-web", "/usr/local/bin/code-serve-web-smart")
 
           header_patch = """#!/bin/bash
-          mkdir -p /tmp /dev/shm /root/.config/Code/User /root/.vscode-server-data/data/Machine /root/.vscode-server-data/data/User /root/Workspace /usr/local/bin
+          export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/vscode-arm64/bin:$PATH
+          mkdir -p /tmp /tmp/runtime-root /dev/shm /root/.config/Code/User /root/.vscode-server-data/data/Machine /root/.vscode-server-data/data/User /root/Workspace /usr/local/bin
           chmod 1777 /tmp /dev/shm || true
+          chmod 0700 /tmp/runtime-root || true
+          export XDG_RUNTIME_DIR=/tmp/runtime-root
 
           if [ ! -f /usr/local/bin/sudo ]; then
               printf '#!/bin/sh\\nexec "$@"\\n' > /usr/local/bin/sudo
@@ -635,6 +697,14 @@ jobs:
 
           if [ -f /opt/vscode-arm64/bin/code ]; then
               sed -i 's|/proc/version|/dev/null|g' /opt/vscode-arm64/bin/code || true
+          fi
+
+          # Auto-heal if dpkg was interrupted earlier or Xtigervnc / libnspr4.so is missing
+          if ! command -v Xtigervnc >/dev/null 2>&1 || ! ldconfig -p 2>/dev/null | grep -q libnspr4.so; then
+              if [ ! -f /usr/bin/Xtigervnc ]; then
+                  echo "[start-vscode] Missing X11/VS Code libraries detected. Running automatic repair..."
+                  bash /root/init-rootfs.sh
+              fi
           fi
 
           for S_PATH in "/root/.vscode-server-data/data/Machine/settings.json" "/root/.vscode-server-data/data/User/settings.json"; do
@@ -829,7 +899,7 @@ jobs:
           gh release create "$RELEASE_TAG" PocketVSCode-arm64.apk pocket-vscode-permanent.keystore \
             --target "${{ github.sha }}" \
             --title "Pocket VS Code ($RELEASE_TAG)" \
-            --notes "Package ID com.pocket.vscode, official VS Code icon, 0-100% auto-extraction loading screen, Mode 2 auto-open, and 0.5s auto-save."
+            --notes "Fixed dpkg interruption recovery, libnspr4/Xtigervnc auto-install, and XDG_RUNTIME_DIR permissions."
 
       - name: Upload Artifact Backup
         if: always()
